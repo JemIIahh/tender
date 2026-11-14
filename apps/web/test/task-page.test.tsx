@@ -1087,6 +1087,134 @@ test("task_page_says_so_when_a_settled_task_has_no_scorecard_to_show", async () 
   expect(missing.textContent).toContain(HASH_B);
 });
 
+// ---- A task settled with signatures the contract checked ---------------------------------------
+
+const SIGNED = [
+  {
+    signer_id: "nearai-tee-1",
+    model: "Qwen/Qwen3.8-27B",
+    request_hash: HASH_A,
+    response_hash: HASH_B,
+  },
+  {
+    signer_id: "nearai-tee-1",
+    model: "Qwen/Qwen3.8-27B",
+    request_hash: HASH_B,
+    response_hash: HASH_C,
+  },
+];
+
+test("task_page_marks_a_task_the_contract_paid_after_checking_signatures", async () => {
+  pinClock(AT.fallback + 60n * SECOND);
+  fakeApi(routes(() => settledTask({ attestations: SIGNED })));
+
+  await open("7", { judgeAccount: VERIFIER });
+
+  const panel = within(screen.getByTestId("attested"));
+  expect(panel.getByRole("heading", { level: 2 }).textContent).toBe("TEE-attested");
+  // The model, and how many signatures the contract checked before it paid.
+  const summary = panel.getByTestId("attested-summary").textContent ?? "";
+  expect(summary).toContain("the contract checked 2 signatures");
+  expect(summary).toContain("Qwen/Qwen3.8-27B");
+  // Each signature's hashes, as the events have them.
+  const rows = panel.getAllByTestId("attestation");
+  expect(rows).toHaveLength(2);
+  expect(rows[0]?.textContent).toContain("nearai-tee-1");
+  expect(rows[0]?.textContent).toContain(HASH_A);
+  expect(rows[0]?.textContent).toContain(HASH_B);
+  expect(rows[1]?.textContent).toContain(HASH_C);
+  // How to check it again, for this task, against the chain this build is for.
+  const command = panel.getByTestId("attested-command").textContent ?? "";
+  expect(command).toMatch(
+    /^node scripts\/verify-scorecard\.mjs --task 7 --contract \S+ --api \S+ --/,
+  );
+  expect(panel.getByText(/prints ATTESTED/)).toBeTruthy();
+  // What it does not show, in plain words.
+  expect(panel.getByTestId("attested-limits").textContent).toContain(
+    "This does not prove the score is correct.",
+  );
+  // The Checker card carries the mark too, and it links to the panel.
+  const chip = within(screen.getByTestId("verifier-record")).getByTestId("attested-chip");
+  expect(chip.textContent).toContain("TEE-attested");
+  expect(chip.getAttribute("href")).toBe("#attested");
+  expect(screen.queryByTestId("verifier-not-attested")).toBeNull();
+});
+
+test("task_page_says_one_signature_in_the_singular", async () => {
+  pinClock(AT.fallback + 60n * SECOND);
+  fakeApi(routes(() => settledTask({ attestations: SIGNED.slice(0, 1) })));
+
+  await open();
+
+  const panel = within(screen.getByTestId("attested"));
+  expect(panel.getByTestId("attested-summary").textContent).toContain(
+    "the contract checked 1 signature, each from a signer",
+  );
+  expect(panel.getAllByTestId("attestation")).toHaveLength(1);
+});
+
+test("task_page_has_no_attested_mark_on_a_pick_without_signatures", async () => {
+  pinClock(AT.fallback + 60n * SECOND);
+  fakeApi(routes(() => settledTask({ attestations: [] })));
+
+  await open("7", { judgeAccount: VERIFIER });
+
+  expect(screen.queryByTestId("attested")).toBeNull();
+  expect(screen.queryByTestId("attested-chip")).toBeNull();
+  // On a pick the Judge made, the Checker card says that the pick has none.
+  expect(screen.getByTestId("verifier-not-attested").textContent).toBe(
+    "This pick has no attestation: the contract checked no signature when it settled the task.",
+  );
+});
+
+test("task_page_does_not_call_a_void_by_the_keeper_or_the_posters_pick_an_unattested_judge_pick", async () => {
+  pinClock(AT.fallback + 60n * SECOND);
+  // Nobody picked: the keeper voided it (`by` is null), and the poster picked in the fallback
+  // window. Neither is a pick by the Judge, so the card says nothing of attestations.
+  const outcomes: TaskOutcome[] = [
+    {
+      kind: "voided",
+      task_id: "7",
+      reason: "expired",
+      by: null,
+      refunds: [{ account: POSTER, amount: "1500000" }],
+      scorecard_hash: null,
+      scorecard_uri: null,
+    },
+    { ...picked, by: POSTER },
+  ];
+  for (const outcome of outcomes) {
+    fakeApi(
+      routes(() =>
+        detail(
+          { phase: "settled", outcome_kind: outcome.kind, outcome },
+          { attestations: [], scorecard: null },
+        ),
+      ),
+    );
+    await open("7", { judgeAccount: VERIFIER });
+    expect(screen.queryByTestId("verifier-not-attested"), outcome.kind).toBeNull();
+    expect(screen.queryByTestId("attested")).toBeNull();
+    cleanup();
+  }
+});
+
+test("task_page_claims_nothing_about_signatures_when_the_api_says_nothing_of_them", async () => {
+  pinClock(AT.fallback + 60n * SECOND);
+  // An API from before `attestations`, and a task still open: neither has the field.
+  fakeApi(routes(() => settledTask()));
+  await open("7", { judgeAccount: VERIFIER });
+  expect(screen.queryByTestId("attested")).toBeNull();
+  expect(screen.queryByTestId("verifier-not-attested")).toBeNull();
+  cleanup();
+
+  pinClock(AT.created + 30n * SECOND);
+  fakeApi(routes(() => detail({}, { attestations: [] })));
+  await open("7", { judgeAccount: VERIFIER });
+  expect(screen.queryByTestId("attested")).toBeNull();
+  expect(screen.queryByTestId("verifier-not-attested")).toBeNull();
+});
+
 test("task_page_shows_a_refund_when_the_task_was_voided", async () => {
   pinClock(AT.fallback + 60n * SECOND);
   const voided: TaskOutcome = {

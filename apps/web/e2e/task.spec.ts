@@ -1,3 +1,5 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { sha256Hex } from "@tender/shared";
 import { AT, HASH_A, HASH_B, SECOND } from "../test/tasks";
@@ -240,3 +242,83 @@ test("page_recovers_when_the_stream_is_refused_and_served_again", async ({ page 
   api.commit("2", "dave.testnet");
   await expect(summary(page)).toHaveText("4 committed · 0 revealed", { timeout: 15_000 });
 });
+
+// A task the Judge settled with `pick_attested`: the contract checked two signatures before it paid,
+// and the page says so, on a phone and on a desktop. With ATTEST_SHOTS set to a directory, the
+// Checker card and the panel are also saved there as screenshots at 375 and 1440 px wide. The hashes
+// are those of the real NEAR AI Cloud signature captured in docs/research/S1-fixture.json.
+const SHOTS = process.env.ATTEST_SHOTS;
+const SIGNED = [
+  {
+    signer_id: "nearai-tee-1",
+    model: "Qwen/Qwen3.8-27B",
+    request_hash: "c1277493658c555dd2440f130b9c645dc5bec3d3fc89a1f425c8e6d9ee2a1354",
+    response_hash: "bbca0d694929bfd3d1cf027fbe402da23f24f689db96ca5df244fe5db335be7a",
+  },
+  {
+    signer_id: "nearai-tee-1",
+    model: "Qwen/Qwen3.8-27B",
+    request_hash: HASH_A,
+    response_hash: HASH_B,
+  },
+];
+
+for (const phone of [true, false]) {
+  test(`attested_task_page_shows_the_mark_${phone ? "on_a_phone" : "on_a_desktop"}`, async ({
+    page,
+  }) => {
+    const size = phone ? { width: 375, height: 812 } : { width: 1440, height: 900 };
+    await page.setViewportSize(size);
+    await page.clock.install({ time: at(AT.reveal + 60n * SECOND) });
+    const api = await routeApi(page);
+    api.reveal("2", "alice.testnet", HASH_A);
+    api.reveal("2", "bob.testnet", HASH_B);
+    await page.goto(TASK);
+    await expect(chip(page)).toHaveText("Judging");
+    await expect(page.getByTestId("attested")).toHaveCount(0);
+
+    const before = api.details.get("2");
+    if (!before) throw new Error("the fixture has no task 2");
+    api.settle({ ...pickedPage(before), attestations: SIGNED });
+
+    await expect(chip(page)).toHaveText("Settled");
+    const panel = page.getByTestId("attested");
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole("heading", { level: 2 })).toHaveText("TEE-attested");
+    await expect(panel.getByTestId("attested-summary")).toContainText(
+      "the contract checked 2 signatures",
+    );
+    await expect(panel.getByTestId("attestation")).toHaveCount(2);
+    await expect(panel.getByTestId("attested-command")).toContainText(
+      "node scripts/verify-scorecard.mjs --task 2 --contract tender.tender-team.testnet",
+    );
+    await expect(page.getByTestId("verifier-record").getByTestId("attested-chip")).toBeVisible();
+
+    const { client, ...scroll } = await page.evaluate(() => ({
+      client: document.documentElement.clientWidth,
+      page: document.documentElement.scrollWidth,
+      body: document.body.scrollWidth,
+    }));
+    const room = Math.min(size.width, client);
+    expect(scroll.page, "the page is wider than the screen").toBeLessThanOrEqual(room);
+    expect(scroll.body, "the body is wider than the screen").toBeLessThanOrEqual(room);
+
+    if (SHOTS !== undefined && SHOTS !== "") {
+      mkdirSync(SHOTS, { recursive: true });
+      // The sticky header and the dev server's badge would sit over the section in the picture.
+      await page.addStyleTag({
+        content: "header.sticky { position: static !important } nextjs-portal { display: none }",
+      });
+      for (const [name, locator] of [
+        ["checker", page.getByTestId("verifier-record")],
+        ["attested", panel],
+      ] as const) {
+        await locator.scrollIntoViewIfNeeded();
+        await locator.screenshot({
+          path: join(SHOTS, `${size.width}-${name}.png`),
+          animations: "disabled",
+        });
+      }
+    }
+  });
+}

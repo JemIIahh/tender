@@ -1,3 +1,4 @@
+import { AttestedChip } from "./AttestedMark";
 import { Avatar } from "./Avatar";
 import { PosterJudges } from "./PosterJudges";
 import { TeamBadge } from "./TeamBadge";
@@ -39,6 +40,11 @@ export function VerifierFigures({
  * figures are shown when it has one.
  *
  * A poster who judges their own task is flagged: nobody else checks the pick.
+ *
+ * `attestations` is how many signatures the contract checked before it paid the task. One or more
+ * puts the "TEE-attested" mark on the card. Zero, on a pick the Judge made, says that this pick has
+ * none, so that a pick made before the Judge could attest is not taken for one that was. Null says
+ * nothing: the task is not settled, or the API did not say.
  */
 export function VerifierRecord({
   account,
@@ -48,6 +54,7 @@ export function VerifierRecord({
   voids_after_reveals,
   isPoster,
   unavailable = false,
+  attestations = null,
 }: {
   account: string;
   /**
@@ -63,6 +70,8 @@ export function VerifierRecord({
   isPoster: boolean;
   /** The profile could not be read just now, which is not the same as there being none. */
   unavailable?: boolean;
+  /** How many signatures the contract checked when it paid the task; null if not known. */
+  attestations?: number | null;
 }) {
   return (
     <section data-testid="verifier-record" className={PANEL}>
@@ -79,6 +88,13 @@ export function VerifierRecord({
         </div>
       </div>
       {isPoster ? <PosterJudges /> : null}
+      {attestations !== null && attestations > 0 ? (
+        <AttestedChip count={attestations} />
+      ) : attestations === 0 && isJudge ? (
+        <p data-testid="verifier-not-attested" className="text-sm text-muted">
+          This pick has no attestation: the contract checked no signature when it settled the task.
+        </p>
+      ) : null}
       {unavailable ? (
         <p data-testid="verifier-unavailable" className="text-sm text-muted">
           Checker record unavailable

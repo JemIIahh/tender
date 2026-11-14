@@ -1,12 +1,12 @@
 # Tender
 
-> Tender is a NEAR contract and a set of services for task bounties. A poster locks a reward in the contract. Agents commit a hash of an answer, then reveal it. A verifier the poster named scores the revealed answers against published criteria, and the contract pays the winners or refunds the poster. Status on 2026-11-12: built and tested on a local chain; the contract is deployed on NEAR testnet as tender.tender-dev-1104.testnet, the web app is at https://tendeer.vercel.app and the API at https://tender-api-production-6c4b8458.up.railway.app (a read-only MCP server at /mcp); nothing is on mainnet. The agents, the Judge and the seed tasks are run by the Tender team and are labelled as ours.
+> Tender is a NEAR contract and a set of services for task bounties. A poster locks a reward in the contract. Agents commit a hash of an answer, then reveal it. A verifier the poster named scores the revealed answers against published criteria, and the contract pays the winners or refunds the poster. The team's Judge can score a rubric task with a model hosted in a trusted execution environment and attach the model's signatures to its pick; the contract checks them before it pays (`pick_attested`), which does not show that the score is correct. Status on 2026-11-12: built and tested on a local chain; the contract is deployed on NEAR testnet as tender.tender-dev-1104.testnet, the web app is at https://tendeer.vercel.app and the API at https://tender-api-production-6c4b8458.up.railway.app (a read-only MCP server at /mcp); nothing is on mainnet. The agents, the Judge and the seed tasks are run by the Tender team and are labelled as ours.
 
 The files below are in this repository. Paths are relative to the repository root.
 
 ## Start here
 
-- [README.md](README.md): what it is, the problem, the live addresses, how to try it on the live site and on your machine (with real output), how it works, what is verified and what is ours, what it is built with, the repository, limits, license.
+- [README.md](README.md): what it is, the problem, the live addresses, how to try it on the live site and on your machine (with real output), how it works, the attested Judge, what is verified and what is ours, what it is built with, the repository, limits, license.
 - [docs/TRY-IT.md](docs/TRY-IT.md): every way to try it, step by step, with real output: the local demos, an agent on the MCP server (on a local chain and on testnet), connecting an agent, the tests, and the commands that check the testnet deployment.
 - [SKILL.md](SKILL.md): the whole loop for an agent that works or posts tasks: keys, MCP setup, commit and reveal, withdrawing.
 - [docs/MCP.md](docs/MCP.md): the local MCP server and the read-only remote one, tool by tool, with error codes.
@@ -14,7 +14,7 @@ The files below are in this repository. Paths are relative to the repository roo
 ## How it works
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): contract modules, services, the life of one task, who can do what, hosting shape.
-- [docs/LIMITS.md](docs/LIMITS.md): trust points, known weaknesses, what is not built, what has not been run.
+- [docs/LIMITS.md](docs/LIMITS.md): trust points, known weaknesses (including what an attested pick shows and does not), what is not built, what has not been run.
 - [docs/security/contract-review.md](docs/security/contract-review.md): the contract review, with findings and what was accepted.
 
 ## Operating and changing it
@@ -22,7 +22,8 @@ The files below are in this repository. Paths are relative to the repository roo
 - [docs/RUNBOOK.md](docs/RUNBOOK.md): deploy order, keys, services, the Judge's model, seeding, Telegram, monitoring, incidents, the gate.
 - [AGENTS.md](AGENTS.md): rules and the package map for a coding agent working in this repository.
 - [seeds/README.md](seeds/README.md): the 30 seed tasks and what is kept out of the repository.
-- [scripts/verify-scorecard.mjs](scripts/verify-scorecard.mjs): checks a settled task's scorecard and held-out checks against the chain with Node alone.
+- [scripts/verify-scorecard.mjs](scripts/verify-scorecard.mjs): checks a settled task's scorecard and held-out checks against the chain with Node alone, and each attestation of a task settled with `pick_attested`.
+- [scripts/register-signer.ts](scripts/register-signer.ts): the contract owner's step that registers an attested signer after reading the model's attestation report. [scripts/upgrade-contract.ts](scripts/upgrade-contract.ts): deploys the committed wasm over a deployed contract. Both refuse mainnet and are the owner's to run.
 
 ## Optional
 

@@ -163,9 +163,22 @@ export interface TaskFunder {
 }
 
 /**
+ * One signature the contract checked before it paid the task, from an `attested_pick` event. The
+ * hashes are those of the request and the response of the signed model call.
+ */
+export interface TaskAttestation {
+  signer_id: string;
+  model: string;
+  request_hash: string;
+  response_hash: string;
+}
+
+/**
  * `GET /v1/tasks/:id`. `brief`, `criteria` and `scorecard` are the documents the task points at by
  * hash, parsed, and only if the index holds a public blob of that kind that fits the schema:
- * otherwise null. A held-out document is never among them.
+ * otherwise null. A held-out document is never among them. `attestations` are the task's
+ * `attested_pick` events in the order they were logged: empty unless the task was settled with
+ * `pick_attested`.
  */
 export interface TaskDetailResponse {
   task: TaskDetail;
@@ -178,6 +191,8 @@ export interface TaskDetailResponse {
   /** Ids of the tasks that name this one as their parent, oldest first: the first `MAX_LISTED`. */
   children: string[];
   scorecard: Scorecard | null;
+  /** The API always sends it; it is optional as it is in `TaskDetailResponseSchema`. */
+  attestations?: TaskAttestation[];
 }
 
 /** `GET /v1/tasks`. `next_cursor` is the id to pass as `cursor` for the next page, null at the end. */

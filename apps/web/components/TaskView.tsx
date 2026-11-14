@@ -9,6 +9,7 @@ import {
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { verifyCommand } from "../lib/attested";
 import { formatBps } from "../lib/bps";
 import { useNowNs } from "../lib/clock";
 import { config } from "../lib/config";
@@ -19,6 +20,7 @@ import { awaitsJudge, isJudgeAccount, JUDGE_POLL_MS } from "../lib/judge";
 import { phaseOfTask } from "../lib/phase";
 import { view } from "../lib/rpc";
 import { Amount } from "./Amount";
+import { AttestedMark } from "./AttestedMark";
 import { Avatar } from "./Avatar";
 import { TaskActions } from "./actions/TaskActions";
 import { BriefSection } from "./BriefSection";
@@ -183,6 +185,16 @@ function ReadyView({
   onTreeIds: (ids: ReadonlySet<string>) => void;
 }) {
   const { task, brief, criteria, entries, funders, children, scorecard } = loaded.data;
+  // The signatures the contract checked before it paid. An API from before the field says nothing,
+  // which is not the same as saying there were none. "None" is said of a pick the verifier made, and
+  // not of a void by the keeper or a pick by the poster in the fallback window.
+  const attestations = loaded.data.attestations ?? [];
+  const attestedCount =
+    task.outcome === null || loaded.data.attestations === undefined
+      ? null
+      : attestations.length > 0 || task.outcome.by === task.verifier
+        ? attestations.length
+        : null;
   // The phase by the clock, so that a window ends on the page when it ends in the contract.
   const phase = phaseOfTask(task, nowNs);
   const scorecardHash = task.outcome?.scorecard_hash ?? null;
@@ -276,6 +288,7 @@ function ReadyView({
         voids_after_reveals={record?.voids_after_reveals ?? null}
         isPoster={task.poster === task.verifier}
         unavailable={loaded.verifier === "unavailable"}
+        attestations={attestedCount}
       />
       {scorecard !== null ? (
         <Scorecard
@@ -290,6 +303,9 @@ function ReadyView({
             {`The scorecard is not available from this server. Its sha256 is ${scorecardHash}.`}
           </p>
         </section>
+      )}
+      {attestations.length === 0 ? null : (
+        <AttestedMark attestations={attestations} command={verifyCommand(task.id, config)} />
       )}
       {task.outcome === null ? null : (
         <Payouts

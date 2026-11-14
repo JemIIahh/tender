@@ -283,6 +283,11 @@ export function HowItWorksView() {
               whose key is on our server.
             </p>
             <p>
+              The Judge can score a rubric with a model that runs in a trusted execution environment
+              (TEE). The task page then shows a TEE-attested mark: the contract checked the
+              model&rsquo;s signature before it paid. The mark does not say the score is right.
+            </p>
+            <p>
               The Tender team holds the full-access key of the contract's account, so it can deploy
               new code.
             </p>
