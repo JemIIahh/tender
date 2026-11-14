@@ -285,7 +285,7 @@ impl Tender {
 impl Tender {
     /// The start of every owner-only method: exactly 1 yoctoNEAR is attached, then the caller is
     /// the owner (`E_OWNER`). Returns the owner, who pays for any storage the call adds.
-    fn assert_owner(&self) -> AccountId {
+    pub(crate) fn assert_owner(&self) -> AccountId {
         assert_one_yocto();
         let caller = env::predecessor_account_id();
         if caller != self.owner {

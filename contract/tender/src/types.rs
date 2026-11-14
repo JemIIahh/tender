@@ -79,6 +79,7 @@ pub mod err {
     pub const E_SETTLED: &str = "E_SETTLED";
     pub const E_VERSION: &str = "E_VERSION";
     pub const E_NOT_REGISTERED: &str = "E_NOT_REGISTERED";
+    pub const E_ATTESTATION: &str = "E_ATTESTATION";
 }
 
 /// Parses a 64-character lowercase hex string into 32 bytes.

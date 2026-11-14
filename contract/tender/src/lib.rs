@@ -11,6 +11,8 @@
 //! arguments.
 
 mod admin;
+#[cfg(feature = "attested")]
+mod attest;
 mod auth;
 mod entries;
 mod events;
@@ -33,7 +35,8 @@ use crate::types::{
     DEFAULT_BOND_COOLDOWN_SECS, MAX_FEE_BPS, MAX_WINDOW_SECS,
 };
 
-/// Storage prefixes, one per collection in `Tender`, in field order.
+/// Storage prefixes, one per collection in `Tender`, in field order, and then the prefixes of the
+/// records kept outside the `Tender` struct, which a deployed state gains without a `migrate`.
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
 enum StorageKey {
@@ -46,6 +49,9 @@ enum StorageKey {
     Agents,
     Delegates,
     DelegateCounts,
+    /// The attested signers (`set_attested_signer`), one raw record per signer id.
+    #[cfg_attr(not(feature = "attested"), allow(dead_code))]
+    AttestedSigners,
 }
 
 /// The contract state: configuration, the internal vault, and every task, entry and agent.
@@ -195,6 +201,7 @@ mod tests {
             StorageKey::Agents,
             StorageKey::Delegates,
             StorageKey::DelegateCounts,
+            StorageKey::AttestedSigners,
         ];
         for (tag, key) in prefixes.iter().enumerate() {
             assert_eq!(borsh::to_vec(key).unwrap(), [tag as u8], "prefix {tag}");

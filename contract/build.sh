@@ -68,8 +68,10 @@ rm -f "$built_tender" "$built_token" "$built_setup"
 # check at the end fails.
 sources=$(./check-res.sh --print)
 
-# cargo-near builds the crate in the current directory.
-(cd tender && cargo near build non-reproducible-wasm --env "$wasm_rustflags")
+# cargo-near builds the crate in the current directory. Tender is built with its `attested`
+# feature (set_attested_signer, get_attested_signer and pick_attested, which need near-sdk's
+# ecrecover), named here so that the release wasm has it whatever the crate's defaults say.
+(cd tender && cargo near build non-reproducible-wasm --features attested --env "$wasm_rustflags")
 (cd test-token && cargo near build non-reproducible-wasm --env "$wasm_rustflags")
 # agent-setup has no near-sdk in its code, so it has no ABI to make.
 (cd agent-setup && cargo near build non-reproducible-wasm --no-abi --env "$wasm_rustflags")

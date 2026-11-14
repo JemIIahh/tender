@@ -92,6 +92,9 @@ impl Tender {
     /// send them, as long as it is not a delegate key. A verifier with no delegate key may also
     /// pick through a relayer, or be a contract, such as a DAO, that picks in a cross-contract
     /// call.
+    ///
+    /// `pick_attested` is this method with TEE attestations attached. The two share
+    /// `settle_pick`, so every rule above holds for both, in the same order.
     #[deny_unknown_arguments]
     pub fn pick(
         &mut self,
@@ -100,120 +103,7 @@ impl Tender {
         scorecard_hash: String,
         scorecard_uri: String,
     ) {
-        let caller = env::predecessor_account_id();
-        let id = task_id.0;
-        let mut task = self.tasks.get(&id).cloned().unwrap_or_else(|| no_task(id));
-        let current = phase(&task, env::block_timestamp());
-        if current == Phase::Settled {
-            already_settled(id);
-        }
-        if caller != task.verifier && caller != task.poster {
-            env::panic_str(&format!(
-                "{}: only the verifier or the poster can pick task {id}",
-                err::E_AUTH
-            ));
-        }
-        // A key that may spend within caps must not also decide where an escrow goes, or a
-        // leaked one could award any task its account judges. Relayed as a NEP-366
-        // meta-transaction, or sent from another contract, the call shows someone else as the
-        // signer and hides the key that signed, which could be one of the caller's delegate keys
-        // (independent review H1). So such a call is refused while the caller has any.
-        if env::signer_account_id() != caller {
-            if self.has_delegates(&caller) {
-                env::panic_str(&format!(
-                    "{}: {caller} has delegate keys, so task {id} can be picked only in a \
-                     transaction that {caller} signs itself, not through a relayer or another \
-                     contract",
-                    err::E_AUTH
-                ));
-            }
-        } else if self.signed_by_delegate(&caller) {
-            env::panic_str(&format!(
-                "{}: task {id} cannot be picked with a delegate key; sign with another key of {caller}",
-                err::E_AUTH
-            ));
-        }
-        // A poster who is also the verifier passes in both windows.
-        let in_window = match current {
-            Phase::Judging => caller == task.verifier,
-            Phase::Fallback => caller == task.poster,
-            _ => false,
-        };
-        if !in_window {
-            env::panic_str(&format!(
-                "{}: task {id} is not in {caller}'s pick window",
-                err::E_PHASE
-            ));
-        }
-        check_uri("scorecard_uri", &scorecard_uri);
-        let scorecard_hash = parse_hash("scorecard_hash", &scorecard_hash);
-
-        if winners.is_empty() {
-            // Every rule has been checked.
-            if task.reveal_count > 0 {
-                self.with_profile(&caller, |p| {
-                    p.voids_after_reveals = p.voids_after_reveals.saturating_add(1)
-                });
-            }
-            self.void(
-                task,
-                VoidReason::NoAward,
-                Some(caller),
-                Some((scorecard_hash, scorecard_uri)),
-            );
-            return;
-        }
-
-        self.check_winners(&task, &winners);
-        let bps: Vec<u16> = winners.iter().map(|w| w.bps).collect();
-        let (fee, amounts) = split_reward(task.reward, task.fee_bps, &bps);
-        let payouts: Vec<Payout> = winners
-            .into_iter()
-            .zip(amounts)
-            .map(|(w, amount)| Payout {
-                account: w.account,
-                bps: w.bps,
-                amount,
-            })
-            .collect();
-
-        // Every rule has been checked and every amount is known. What follows credits slots that
-        // exist and records what was paid.
-        let token = task.token.clone();
-        // The treasury has a slot for every allowlisted token: `set_token` makes it when the token
-        // is allowlisted, and `set_fee` makes the new treasury's before it switches.
-        let treasury = self.treasury.clone();
-        self.credit(&treasury, &token, fee);
-        for p in &payouts {
-            // A winner's slot was made when it committed.
-            self.credit(&p.account, &token, p.amount);
-            self.with_profile(&p.account, |profile| {
-                profile.wins = profile.wins.saturating_add(1);
-                // Only an existing `earned` slot is updated. Adding one would add storage.
-                if let Some((_, earned)) = profile.earned.iter_mut().find(|(t, _)| *t == token) {
-                    *earned = earned.saturating_add(p.amount);
-                }
-            });
-        }
-        self.with_profile(&caller, |p| p.picks_made = p.picks_made.saturating_add(1));
-        let event = TaskPicked {
-            task_id,
-            by: caller,
-            winners: payouts.iter().map(PayoutView::from).collect(),
-            fee: U128(fee),
-            scorecard_hash: hex32(&scorecard_hash),
-            scorecard_uri: scorecard_uri.clone(),
-        };
-        self.write_outcome(
-            &mut task,
-            Outcome::Picked {
-                winners: payouts,
-                fee,
-                scorecard_hash,
-                scorecard_uri,
-            },
-        );
-        emit("picked", &event);
+        self.settle_pick(task_id, winners, scorecard_hash, scorecard_uri, || ());
     }
 
     /// Voids task `task_id` and refunds each of its funders exactly what it paid in. Anyone may
@@ -308,6 +198,145 @@ impl Tender {
 }
 
 impl Tender {
+    /// The body of `pick`, which `pick_attested` shares, so that the two cannot check different
+    /// rules: checks every rule `pick` lists, in that order, then calls `last_check`, and only
+    /// then settles, as `pick` describes. Returns what `last_check` returned.
+    ///
+    /// `last_check` is where a caller adds its own rules. Nothing has changed when it runs, so a
+    /// panic in it leaves the state as it was, and no event has been logged.
+    pub(crate) fn settle_pick<R>(
+        &mut self,
+        task_id: U64,
+        winners: Vec<WinnerArg>,
+        scorecard_hash: String,
+        scorecard_uri: String,
+        last_check: impl FnOnce() -> R,
+    ) -> R {
+        let caller = env::predecessor_account_id();
+        let id = task_id.0;
+        let mut task = self.tasks.get(&id).cloned().unwrap_or_else(|| no_task(id));
+        let current = phase(&task, env::block_timestamp());
+        if current == Phase::Settled {
+            already_settled(id);
+        }
+        if caller != task.verifier && caller != task.poster {
+            env::panic_str(&format!(
+                "{}: only the verifier or the poster can pick task {id}",
+                err::E_AUTH
+            ));
+        }
+        // A key that may spend within caps must not also decide where an escrow goes, or a
+        // leaked one could award any task its account judges. Relayed as a NEP-366
+        // meta-transaction, or sent from another contract, the call shows someone else as the
+        // signer and hides the key that signed, which could be one of the caller's delegate keys
+        // (independent review H1). So such a call is refused while the caller has any.
+        if env::signer_account_id() != caller {
+            if self.has_delegates(&caller) {
+                env::panic_str(&format!(
+                    "{}: {caller} has delegate keys, so task {id} can be picked only in a \
+                     transaction that {caller} signs itself, not through a relayer or another \
+                     contract",
+                    err::E_AUTH
+                ));
+            }
+        } else if self.signed_by_delegate(&caller) {
+            env::panic_str(&format!(
+                "{}: task {id} cannot be picked with a delegate key; sign with another key of {caller}",
+                err::E_AUTH
+            ));
+        }
+        // A poster who is also the verifier passes in both windows.
+        let in_window = match current {
+            Phase::Judging => caller == task.verifier,
+            Phase::Fallback => caller == task.poster,
+            _ => false,
+        };
+        if !in_window {
+            env::panic_str(&format!(
+                "{}: task {id} is not in {caller}'s pick window",
+                err::E_PHASE
+            ));
+        }
+        check_uri("scorecard_uri", &scorecard_uri);
+        let scorecard_hash = parse_hash("scorecard_hash", &scorecard_hash);
+
+        // The winners' rules and every amount, or `None` for an empty pick.
+        let settlement = if winners.is_empty() {
+            None
+        } else {
+            self.check_winners(&task, &winners);
+            let bps: Vec<u16> = winners.iter().map(|w| w.bps).collect();
+            let (fee, amounts) = split_reward(task.reward, task.fee_bps, &bps);
+            let payouts: Vec<Payout> = winners
+                .into_iter()
+                .zip(amounts)
+                .map(|(w, amount)| Payout {
+                    account: w.account,
+                    bps: w.bps,
+                    amount,
+                })
+                .collect();
+            Some((fee, payouts))
+        };
+        // Every rule of `pick` has been checked and nothing has changed yet. The caller's own
+        // rules come last, so a panic in them changes nothing either.
+        let checked = last_check();
+
+        let Some((fee, payouts)) = settlement else {
+            if task.reveal_count > 0 {
+                self.with_profile(&caller, |p| {
+                    p.voids_after_reveals = p.voids_after_reveals.saturating_add(1)
+                });
+            }
+            self.void(
+                task,
+                VoidReason::NoAward,
+                Some(caller),
+                Some((scorecard_hash, scorecard_uri)),
+            );
+            return checked;
+        };
+
+        // Every rule has been checked and every amount is known. What follows credits slots that
+        // exist and records what was paid.
+        let token = task.token.clone();
+        // The treasury has a slot for every allowlisted token: `set_token` makes it when the token
+        // is allowlisted, and `set_fee` makes the new treasury's before it switches.
+        let treasury = self.treasury.clone();
+        self.credit(&treasury, &token, fee);
+        for p in &payouts {
+            // A winner's slot was made when it committed.
+            self.credit(&p.account, &token, p.amount);
+            self.with_profile(&p.account, |profile| {
+                profile.wins = profile.wins.saturating_add(1);
+                // Only an existing `earned` slot is updated. Adding one would add storage.
+                if let Some((_, earned)) = profile.earned.iter_mut().find(|(t, _)| *t == token) {
+                    *earned = earned.saturating_add(p.amount);
+                }
+            });
+        }
+        self.with_profile(&caller, |p| p.picks_made = p.picks_made.saturating_add(1));
+        let event = TaskPicked {
+            task_id,
+            by: caller,
+            winners: payouts.iter().map(PayoutView::from).collect(),
+            fee: U128(fee),
+            scorecard_hash: hex32(&scorecard_hash),
+            scorecard_uri: scorecard_uri.clone(),
+        };
+        self.write_outcome(
+            &mut task,
+            Outcome::Picked {
+                winners: payouts,
+                fee,
+                scorecard_hash,
+                scorecard_uri,
+            },
+        );
+        emit("picked", &event);
+        checked
+    }
+
     /// Credits each funder of `t` exactly what it paid into the escrow, in the task's token, and
     /// returns the refunds for the `voided` event. Each funder paid from its own vault slot, so
     /// the slot exists.
@@ -2628,6 +2657,954 @@ mod tests {
                 start[i] + slot_bytes(who, true) + entry_bytes(who, Some(URI)),
                 "{who}"
             );
+        }
+    }
+
+    /// `pick_attested`, on the same worlds as `pick`, with the real NEAR AI Cloud signature in
+    /// `docs/research/S1-fixture.json`.
+    #[cfg(feature = "attested")]
+    mod attested {
+        use super::*;
+        use crate::attest::{check_attestations, AttestationArg, AttestedSignerView};
+
+        const OWNER: &str = "owner.test";
+        const SIGNER: &str = "nearai-qwen";
+        const FIXTURE: &str = include_str!("../../../docs/research/S1-fixture.json");
+
+        /// The fixture's `field`.
+        fn fixture(field: &str) -> String {
+            let v: Value = serde_json::from_str(FIXTURE).unwrap();
+            v[field].as_str().unwrap().to_string()
+        }
+
+        /// The fixture's attestation, by `SIGNER`.
+        fn real() -> AttestationArg {
+            AttestationArg {
+                signer_id: SIGNER.to_string(),
+                text: fixture("text"),
+                signature: fixture("signature"),
+            }
+        }
+
+        /// The owner registers `id` with 1 yoctoNEAR. `Err` holds the panic message.
+        fn try_set_signer(
+            t: &mut Tender,
+            who: &str,
+            id: &str,
+            algo: &str,
+            address: &str,
+            model: &str,
+            enabled: bool,
+        ) -> Result<(), String> {
+            testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+            let args = (
+                id.to_string(),
+                algo.to_string(),
+                address.to_string(),
+                model.to_string(),
+            );
+            match panic_message(|| t.set_attested_signer(args.0, args.1, args.2, args.3, enabled)) {
+                Some(message) => Err(message),
+                None => Ok(()),
+            }
+        }
+
+        /// Registers `SIGNER` with the fixture's address and model, enabled.
+        fn set_real_signer(t: &mut Tender) {
+            let (address, model) = (fixture("signing_address"), fixture("model"));
+            try_set_signer(t, OWNER, SIGNER, "ecdsa", &address, &model, true).unwrap();
+        }
+
+        /// `world()` with `SIGNER` registered, task 1 posted, and bob and carol revealed in it.
+        fn attested_world() -> (Tender, u64) {
+            let mut t = world();
+            set_real_signer(&mut t);
+            let id = post(&mut t, args());
+            revealed(&mut t, id, &["bob.test", "carol.test"]);
+            (t, id)
+        }
+
+        /// `who` calls `pick_attested` at `now`. `Err` holds the panic message.
+        #[allow(clippy::too_many_arguments)]
+        fn try_pick_attested_with(
+            t: &mut Tender,
+            who: &str,
+            id: u64,
+            now: u64,
+            list: &[(&str, u16)],
+            hash: &str,
+            uri: &str,
+            attestations: Vec<AttestationArg>,
+        ) -> Result<(), String> {
+            testing_env!(ctx(who).block_timestamp(now).build());
+            let (list, hash, uri) = (winners(list), hash.to_string(), uri.to_string());
+            match panic_message(|| t.pick_attested(U64(id), list, hash, uri, attestations)) {
+                Some(message) => Err(message),
+                None => Ok(()),
+            }
+        }
+
+        /// The judge picks bob alone in task `id`, in its window, with the default scorecard.
+        fn try_pick_attested(
+            t: &mut Tender,
+            id: u64,
+            attestations: Vec<AttestationArg>,
+        ) -> Result<(), String> {
+            try_pick_attested_with(
+                t,
+                JUDGE,
+                id,
+                REVEAL_DEADLINE,
+                &[("bob.test", 10_000)],
+                SCORECARD_HASH,
+                SCORECARD_URI,
+                attestations,
+            )
+        }
+
+        /// The `attested_pick` log of the fixture's attestation in task `id`.
+        fn attested_log(id: u64) -> String {
+            event(
+                "attested_pick",
+                &format!(
+                    r#"{{"task_id":"{id}","signer_id":"{SIGNER}","model":"{}","request_hash":"{}","response_hash":"{}"}}"#,
+                    fixture("model"),
+                    fixture("request_sha256"),
+                    fixture("response_sha256")
+                ),
+            )
+        }
+
+        /// Asserts that `attestations` are refused `E_ATTESTATION`, with `detail` in the message,
+        /// and that nothing was paid, stored or logged.
+        fn assert_refused(
+            t: &mut Tender,
+            id: u64,
+            attestations: Vec<AttestationArg>,
+            detail: &str,
+        ) {
+            let before = money(t);
+            testing_env!(ctx(JUDGE).block_timestamp(REVEAL_DEADLINE).build());
+            let usage = env::storage_usage();
+            let result = match panic_message(|| {
+                t.pick_attested(
+                    U64(id),
+                    winners(&[("bob.test", 10_000)]),
+                    SCORECARD_HASH.to_string(),
+                    SCORECARD_URI.to_string(),
+                    attestations,
+                )
+            }) {
+                Some(message) => Err(message),
+                None => Ok(()),
+            };
+            assert_eq!(env::storage_usage(), usage, "{detail}: nothing is written");
+            let message = assert_rejected(result, "E_ATTESTATION", detail);
+            assert!(
+                message.contains(detail),
+                "{message:?} does not say {detail:?}"
+            );
+            assert_eq!(money(t), before, "{detail}");
+            assert_eq!(outcome(t, id), None, "{detail}");
+        }
+
+        /// The secp256k1 key the tests make from `seed`.
+        fn test_key(seed: u8) -> secp256k1::SecretKey {
+            secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap()
+        }
+
+        /// The Ethereum address of `test_key(seed)`: `0x` and 40 lowercase hex characters.
+        fn test_address(seed: u8) -> String {
+            let secp = secp256k1::Secp256k1::new();
+            let public = secp256k1::PublicKey::from_secret_key(&secp, &test_key(seed));
+            let key = public.serialize_uncompressed();
+            format!("0x{}", hex::encode(&env::keccak256_array(&key[1..])[12..]))
+        }
+
+        /// EIP-191 `personal_sign` of `text` by `test_key(seed)`, as `0x`, r, s and v (27 or 28).
+        fn test_sign(text: &str, seed: u8) -> String {
+            let message = format!("\x19Ethereum Signed Message:\n{}{text}", text.len());
+            let digest = env::keccak256_array(message.as_bytes());
+            let secp = secp256k1::Secp256k1::new();
+            let message = secp256k1::Message::from_slice(&digest).unwrap();
+            let (id, rs) = secp
+                .sign_ecdsa_recoverable(&message, &test_key(seed))
+                .serialize_compact();
+            format!("0x{}{:02x}", hex::encode(rs), id.to_i32() as u8 + 27)
+        }
+
+        /// An attestation of `model` over the hashes `request` and `response` (each repeated to 64
+        /// hex characters), by `signer`, signed with `test_key(seed)`.
+        fn test_attestation(signer: &str, model: &str, n: usize, seed: u8) -> AttestationArg {
+            let text = format!("{model}:{n:064x}:{:064x}", n + 1000);
+            AttestationArg {
+                signer_id: signer.to_string(),
+                signature: test_sign(&text, seed),
+                text,
+            }
+        }
+
+        #[test]
+        fn the_fixture_is_consistent() {
+            // The fixture's text is model:sha256(request):sha256(response), over the exact bodies.
+            let hash = |s: String| hex::encode(env::sha256(s.as_bytes()));
+            testing_env!(ctx(OWNER).build());
+            assert_eq!(hash(fixture("request")), fixture("request_sha256"));
+            assert_eq!(hash(fixture("response")), fixture("response_sha256"));
+            assert_eq!(
+                fixture("text"),
+                format!(
+                    "{}:{}:{}",
+                    fixture("model"),
+                    fixture("request_sha256"),
+                    fixture("response_sha256")
+                )
+            );
+        }
+
+        #[test]
+        fn a_real_attestation_pays_and_logs() {
+            let (mut t, id) = attested_world();
+            try_pick_attested(&mut t, id, vec![real()]).unwrap();
+            assert_eq!(balance(&t, "bob.test"), 950_000);
+            assert_eq!(balance(&t, TREASURY), 50_000);
+            assert_eq!(
+                outcome(&t, id),
+                Some(OutcomeView::Picked {
+                    winners: vec![payout("bob.test", 10_000, 950_000)],
+                    fee: U128(50_000),
+                    scorecard_hash: SCORECARD_HASH.to_string(),
+                    scorecard_uri: SCORECARD_URI.to_string(),
+                })
+            );
+            assert_eq!(
+                get_logs(),
+                [
+                    event(
+                        "picked",
+                        &format!(
+                            r#"{{"task_id":"1","by":"judge.test","winners":[{{"account":"bob.test","bps":10000,"amount":"950000"}}],"fee":"50000","scorecard_hash":"{SCORECARD_HASH}","scorecard_uri":"{SCORECARD_URI}"}}"#
+                        )
+                    ),
+                    attested_log(id),
+                ]
+            );
+            assert_eq!(agent(&t, "bob.test").wins, 1);
+        }
+
+        #[test]
+        fn pick_attested_settles_and_stores_exactly_as_pick() {
+            // Two tasks alike, one settled by `pick` and one by `pick_attested`: the same
+            // payouts, the same outcome, the same storage, and the same `picked` log first.
+            let mut t = world();
+            set_real_signer(&mut t);
+            let plain = post(&mut t, args());
+            let attested = post(&mut t, args());
+            for id in [plain, attested] {
+                revealed(&mut t, id, &["bob.test", "carol.test"]);
+            }
+            let list = || winners(&[("bob.test", 6_000), ("carol.test", 4_000)]);
+            let (hash, uri) = (|| SCORECARD_HASH.to_string(), || SCORECARD_URI.to_string());
+
+            // Byte counts as signed numbers: settling releases the poster's reserve, so its
+            // charged bytes go down.
+            let alice = |t: &Tender| i128::from(used(t, "alice.test"));
+            let usage = || i128::from(env::storage_usage());
+            let alice_before = alice(&t);
+            testing_env!(ctx(JUDGE).block_timestamp(REVEAL_DEADLINE).build());
+            let before = usage();
+            t.pick(U64(plain), list(), hash(), uri());
+            let plain_grown = usage() - before;
+            let plain_logs = get_logs();
+            let plain_alice = alice(&t) - alice_before;
+            let paid = money(&t);
+
+            testing_env!(ctx(JUDGE).block_timestamp(REVEAL_DEADLINE).build());
+            let before = usage();
+            t.pick_attested(U64(attested), list(), hash(), uri(), vec![real()]);
+            assert_eq!(usage() - before, plain_grown, "no new storage");
+            assert_eq!(alice(&t) - alice_before, 2 * plain_alice);
+            let logs = get_logs();
+            assert_eq!(logs.len(), 2);
+            assert_eq!(
+                logs[0],
+                plain_logs[0].replace(r#""task_id":"1""#, r#""task_id":"2""#)
+            );
+            assert_eq!(logs[1], attested_log(attested));
+            assert_eq!(outcome(&t, attested), outcome(&t, plain));
+            // The second pick paid what the first did.
+            let twice: Vec<u128> = money(&t);
+            assert_eq!(twice[1] - paid[1], paid[1], "the treasury's fee");
+            assert_eq!(twice[2] - paid[2], paid[2], "bob's share");
+            assert_eq!(twice[3] - paid[3], paid[3], "carol's share");
+        }
+
+        #[test]
+        fn an_empty_attested_pick_voids_as_no_award() {
+            let (mut t, id) = attested_world();
+            try_pick_attested_with(
+                &mut t,
+                JUDGE,
+                id,
+                REVEAL_DEADLINE,
+                &[],
+                SCORECARD_HASH,
+                SCORECARD_URI,
+                vec![real()],
+            )
+            .unwrap();
+            assert_eq!(outcome(&t, id), voided(VoidReason::NoAward, true));
+            assert_eq!(balance(&t, "alice.test"), FUNDS);
+            let logs = get_logs();
+            assert_eq!(logs.len(), 2);
+            assert!(logs[0].contains(r#""event":"voided""#), "{}", logs[0]);
+            assert_eq!(logs[1], attested_log(id));
+        }
+
+        #[test]
+        fn twelve_attestations_are_checked_and_logged_in_order() {
+            // Twelve attestations by two signers of two models, with keys the test makes: all are
+            // checked, and each is logged, in order, after `picked`.
+            let mut t = world();
+            let id = post(&mut t, args());
+            revealed(&mut t, id, &["bob.test"]);
+            for (signer, seed, model) in [("one", 1, "model/a"), ("two", 2, "model/b")] {
+                let address = test_address(seed);
+                try_set_signer(&mut t, OWNER, signer, "ecdsa", &address, model, true).unwrap();
+            }
+            let list: Vec<AttestationArg> = (0..12)
+                .map(|n| {
+                    if n % 2 == 0 {
+                        test_attestation("one", "model/a", n, 1)
+                    } else {
+                        test_attestation("two", "model/b", n, 2)
+                    }
+                })
+                .collect();
+            // Thirteen are refused before any is looked at, and so is none.
+            let mut thirteen = list.clone();
+            thirteen.push(test_attestation("one", "model/a", 12, 1));
+            assert_refused(&mut t, id, thirteen, "1 to 12 attestations, got 13");
+            assert_refused(&mut t, id, vec![], "1 to 12 attestations, got 0");
+            // The same text twice is refused, whoever signed it.
+            let mut twice = list[..11].to_vec();
+            twice.push(list[3].clone());
+            assert_refused(
+                &mut t,
+                id,
+                twice,
+                "attestation 11 repeats the text of attestation 3",
+            );
+            // One bad signature among twelve is enough to refuse them all.
+            let mut one_bad = list.clone();
+            one_bad[7].signature = test_sign(&one_bad[7].text, 1);
+            assert_refused(
+                &mut t,
+                id,
+                one_bad,
+                "attestation 7: the signature is not by signer two",
+            );
+
+            testing_env!(ctx(JUDGE).block_timestamp(REVEAL_DEADLINE).build());
+            let gas = env::used_gas();
+            t.pick_attested(
+                U64(id),
+                winners(&[("bob.test", 10_000)]),
+                SCORECARD_HASH.to_string(),
+                SCORECARD_URI.to_string(),
+                list.clone(),
+            );
+            let gas = env::used_gas().as_gas() - gas.as_gas();
+            assert!(
+                gas < 60_000_000_000_000,
+                "twelve attestations used {gas} gas"
+            );
+            let logs = get_logs();
+            assert_eq!(logs.len(), 13);
+            assert!(logs[0].contains(r#""event":"picked""#));
+            for (n, log) in logs[1..].iter().enumerate() {
+                let (signer, model) = if n % 2 == 0 {
+                    ("one", "model/a")
+                } else {
+                    ("two", "model/b")
+                };
+                assert_eq!(
+                    *log,
+                    event(
+                        "attested_pick",
+                        &format!(
+                            r#"{{"task_id":"{id}","signer_id":"{signer}","model":"{model}","request_hash":"{n:064x}","response_hash":"{:064x}"}}"#,
+                            n + 1000
+                        )
+                    )
+                );
+            }
+            assert_eq!(balance(&t, "bob.test"), 950_000);
+        }
+
+        #[test]
+        fn a_changed_text_is_refused() {
+            let (mut t, id) = attested_world();
+            // A response hash with one digit changed: the signature no longer recovers the
+            // signer's address.
+            let mut tampered = real();
+            let last = tampered.text.pop().unwrap();
+            tampered.text.push(if last == '0' { '1' } else { '0' });
+            assert_refused(&mut t, id, vec![tampered], "the signature is not by signer");
+            // The same text with the hashes in upper case, or one cut short, or with more after
+            // it, is not the form signed texts take.
+            let mut upper = real();
+            let model = fixture("model");
+            upper.text = format!("{model}:{}", upper.text[model.len() + 1..].to_uppercase());
+            assert_refused(
+                &mut t,
+                id,
+                vec![upper],
+                "each hash 64 lowercase hex characters",
+            );
+            let mut short = real();
+            short.text.pop();
+            assert_refused(
+                &mut t,
+                id,
+                vec![short],
+                "each hash 64 lowercase hex characters",
+            );
+            let mut long = real();
+            long.text.push_str(":00");
+            assert_refused(
+                &mut t,
+                id,
+                vec![long],
+                "each hash 64 lowercase hex characters",
+            );
+            let mut bare = real();
+            bare.text = "no colon here".to_string();
+            assert_refused(
+                &mut t,
+                id,
+                vec![bare],
+                "text must be model:request_hash:response_hash",
+            );
+        }
+
+        #[test]
+        fn a_text_for_another_model_is_refused() {
+            let (mut t, id) = attested_world();
+            // The signer is registered for another model than the one its text names.
+            let address = fixture("signing_address");
+            try_set_signer(
+                &mut t,
+                OWNER,
+                SIGNER,
+                "ecdsa",
+                &address,
+                "z-ai/glm-5.3-flash",
+                true,
+            )
+            .unwrap();
+            assert_refused(
+                &mut t,
+                id,
+                vec![real()],
+                "text does not name the model z-ai/glm-5.3-flash that signer nearai-qwen signs for",
+            );
+        }
+
+        #[test]
+        fn an_unknown_or_disabled_signer_is_refused() {
+            let (mut t, id) = attested_world();
+            let unknown = AttestationArg {
+                signer_id: "nobody".to_string(),
+                ..real()
+            };
+            assert_refused(
+                &mut t,
+                id,
+                vec![unknown],
+                "no signer is registered as nobody",
+            );
+            // An id longer than any signer id, or longer than a storage key may be, is refused
+            // without a lookup.
+            for bad in [
+                "x".repeat(65),
+                "x".repeat(5_000),
+                "Upper".to_string(),
+                String::new(),
+            ] {
+                let invalid = AttestationArg {
+                    signer_id: bad,
+                    ..real()
+                };
+                assert_refused(&mut t, id, vec![invalid], "is not a registrable signer id");
+            }
+            let (address, model) = (fixture("signing_address"), fixture("model"));
+            try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", &address, &model, false).unwrap();
+            assert_refused(&mut t, id, vec![real()], "signer nearai-qwen is disabled");
+            // Enabled again, the same attestation passes.
+            try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", &address, &model, true).unwrap();
+            try_pick_attested(&mut t, id, vec![real()]).unwrap();
+        }
+
+        #[test]
+        fn a_bad_signature_or_another_address_is_refused() {
+            let (mut t, id) = attested_world();
+            let with_signature = |signature: String| AttestationArg {
+                signature,
+                ..real()
+            };
+            let sig = fixture("signature");
+            // One bit of `s` flipped: some other key, or none, is recovered.
+            let mut bytes = hex::decode(&sig[2..]).unwrap();
+            bytes[40] ^= 1;
+            assert_refused(
+                &mut t,
+                id,
+                vec![with_signature(hex::encode(&bytes))],
+                "attestation 0: the signature",
+            );
+            // The other recovery id recovers another key.
+            let other_v = format!("{}1b", &sig[..sig.len() - 2]);
+            assert_refused(
+                &mut t,
+                id,
+                vec![with_signature(other_v)],
+                "the signature is not by signer",
+            );
+            for v in ["02", "1d", "ff"] {
+                let bad_v = format!("{}{v}", &sig[..sig.len() - 2]);
+                assert_refused(
+                    &mut t,
+                    id,
+                    vec![with_signature(bad_v)],
+                    "recovery id must be 27, 28, 0 or 1",
+                );
+            }
+            for bad in [&sig[..sig.len() - 2], "0x", "", &format!("{sig}00")] {
+                assert_refused(
+                    &mut t,
+                    id,
+                    vec![with_signature(bad.to_string())],
+                    "signature must be 65 bytes in hex",
+                );
+            }
+            let not_hex = format!("0x{}", "zz".repeat(65));
+            assert_refused(
+                &mut t,
+                id,
+                vec![with_signature(not_hex)],
+                "signature must be 65 bytes",
+            );
+            // The real signature, under a signer registered with another address.
+            let model = fixture("model");
+            let other = "0x0000000000000000000000000000000000000001";
+            try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", other, &model, true).unwrap();
+            assert_refused(
+                &mut t,
+                id,
+                vec![real()],
+                "the signature is not by signer nearai-qwen (0x0000000000000000000000000000000000000001)",
+            );
+            // A valid attestation before a bad one does not help.
+            let address = fixture("signing_address");
+            try_set_signer(&mut t, OWNER, "good", "ecdsa", &address, &model, true).unwrap();
+            let good = AttestationArg {
+                signer_id: "good".to_string(),
+                ..real()
+            };
+            let mut second = real();
+            second.text = format!("{model}:{}:{}", "a".repeat(64), "b".repeat(64));
+            assert_refused(&mut t, id, vec![good.clone(), second], "attestation 1:");
+            // The recovery id may be 0 or 1 as well as 27 or 28, and the 0x is optional.
+            let v_one = format!("{}01", &sig[2..sig.len() - 2]);
+            try_pick_attested(&mut t, id, vec![with_signature_for("good", v_one)]).unwrap();
+            fn with_signature_for(signer: &str, signature: String) -> AttestationArg {
+                AttestationArg {
+                    signer_id: signer.to_string(),
+                    signature,
+                    ..real()
+                }
+            }
+        }
+
+        #[test]
+        fn pick_rules_come_first_and_the_attestations_last() {
+            // `pick_rules_are_checked_in_the_listed_order`, through `pick_attested`, with a
+            // tampered attestation: every rule of `pick` is reported before it, in pick's order,
+            // and the attestation is reported last.
+            struct Attempt {
+                who: &'static str,
+                now: u64,
+                hash: &'static str,
+                uri: &'static str,
+                winner: &'static str,
+                attestation: AttestationArg,
+            }
+            type Mend = fn(&mut Tender, &mut Attempt);
+            let mut t = world();
+            set_real_signer(&mut t);
+            let id = post(&mut t, args());
+            assert_eq!(id, 1, "the steps below name the task by its id");
+            enter(&mut t, "bob.test", id, 1);
+            enter(&mut t, "carol.test", id, 2);
+            reveal(&mut t, "bob.test", id, 1);
+            t.tasks.get_mut(&1u64).unwrap().outcome = Some(Outcome::Voided {
+                reason: VoidReason::Expired,
+                scorecard_hash: None,
+                scorecard_uri: None,
+            });
+            let mut attempt = Attempt {
+                who: "erin.test",
+                now: T1,
+                hash: "x",
+                uri: "",
+                winner: "carol.test",
+                attestation: AttestationArg {
+                    signer_id: "nobody".to_string(),
+                    ..real()
+                },
+            };
+            let steps: [(&str, Mend); 7] = [
+                ("E_SETTLED", |t, _| {
+                    t.tasks.get_mut(&1u64).unwrap().outcome = None
+                }),
+                ("E_AUTH", |_, a| a.who = JUDGE),
+                ("E_PHASE", |_, a| a.now = REVEAL_DEADLINE),
+                ("E_URI", |_, a| a.uri = SCORECARD_URI),
+                ("E_HASH", |_, a| a.hash = SCORECARD_HASH),
+                ("E_WINNERS", |_, a| a.winner = "bob.test"),
+                ("E_ATTESTATION", |_, a| a.attestation = real()),
+            ];
+            let send = |t: &mut Tender, a: &Attempt| {
+                let list = &[(a.winner, 10_000)];
+                let attestations = vec![a.attestation.clone()];
+                try_pick_attested_with(t, a.who, 1, a.now, list, a.hash, a.uri, attestations)
+            };
+            for (code, mend) in steps {
+                assert_rejected(send(&mut t, &attempt), code, code);
+                mend(&mut t, &mut attempt);
+            }
+            send(&mut t, &attempt).unwrap();
+            assert_eq!(balance(&t, "bob.test"), 950_000);
+            // Settled now, so a second attested pick is refused as a second pick would be.
+            assert_rejected(
+                send(&mut t, &attempt),
+                "E_SETTLED",
+                "a second pick_attested",
+            );
+        }
+
+        #[test]
+        fn the_windows_and_the_callers_of_pick_hold() {
+            let (mut t, id) = attested_world();
+            let at = |t: &mut Tender, who: &str, now: u64| {
+                try_pick_attested_with(
+                    t,
+                    who,
+                    id,
+                    now,
+                    &[("bob.test", 10_000)],
+                    SCORECARD_HASH,
+                    SCORECARD_URI,
+                    vec![real()],
+                )
+            };
+            // The verifier's window is reveal_deadline..pick_deadline; the poster's is
+            // pick_deadline..fallback_deadline; nobody else's ever.
+            assert_rejected(
+                at(&mut t, JUDGE, REVEAL_DEADLINE - 1),
+                "E_PHASE",
+                "judge early",
+            );
+            assert_rejected(at(&mut t, JUDGE, PICK_DEADLINE), "E_PHASE", "judge late");
+            assert_rejected(
+                at(&mut t, "alice.test", PICK_DEADLINE - 1),
+                "E_PHASE",
+                "poster early",
+            );
+            assert_rejected(
+                at(&mut t, "alice.test", FALLBACK_DEADLINE),
+                "E_PHASE",
+                "poster late",
+            );
+            assert_rejected(
+                at(&mut t, "bob.test", REVEAL_DEADLINE),
+                "E_AUTH",
+                "an entrant",
+            );
+            assert_rejected(at(&mut t, OWNER, REVEAL_DEADLINE), "E_AUTH", "the owner");
+            // The poster's fallback works through pick_attested too.
+            at(&mut t, "alice.test", PICK_DEADLINE).unwrap();
+            assert_eq!(balance(&t, "bob.test"), 950_000);
+        }
+
+        #[test]
+        fn a_delegate_key_cannot_pick_attested() {
+            let (mut t, id) = attested_world();
+            let key = PublicKey::from_parts(CurveType::ED25519, vec![7; 32]).unwrap();
+            testing_env!(ctx(JUDGE).attached_deposit(ONE_YOCTO).build());
+            t.add_delegate(key.clone(), acct(USDC), U128(1), U128(1));
+            testing_env!(ctx(JUDGE)
+                .signer_account_pk(key)
+                .block_timestamp(REVEAL_DEADLINE)
+                .build());
+            let result = match panic_message(|| {
+                t.pick_attested(
+                    U64(id),
+                    winners(&[("bob.test", 10_000)]),
+                    SCORECARD_HASH.to_string(),
+                    SCORECARD_URI.to_string(),
+                    vec![real()],
+                )
+            }) {
+                Some(message) => Err(message),
+                None => Ok(()),
+            };
+            assert_rejected(result, "E_AUTH", "a delegate key");
+            // Relayed, by a verifier that has a delegate key, it is refused too.
+            testing_env!(ctx(JUDGE)
+                .signer_account_id(acct("relayer.test"))
+                .block_timestamp(REVEAL_DEADLINE)
+                .build());
+            let result = match panic_message(|| {
+                t.pick_attested(
+                    U64(id),
+                    winners(&[("bob.test", 10_000)]),
+                    SCORECARD_HASH.to_string(),
+                    SCORECARD_URI.to_string(),
+                    vec![real()],
+                )
+            }) {
+                Some(message) => Err(message),
+                None => Ok(()),
+            };
+            assert_rejected(result, "E_AUTH", "a relayed pick");
+        }
+
+        #[test]
+        fn one_attestation_costs_under_5_tgas() {
+            let (_t, _) = attested_world();
+            testing_env!(ctx(JUDGE).build());
+            let before = env::used_gas();
+            let events = check_attestations(U64(1), &[real()]);
+            let used = env::used_gas().as_gas() - before.as_gas();
+            assert_eq!(events.len(), 1);
+            assert!(used < 5_000_000_000_000, "one attestation used {used} gas");
+            // ecrecover alone is about 0.28 Tgas, so the check did run it.
+            assert!(
+                used > 200_000_000_000,
+                "one attestation used only {used} gas"
+            );
+        }
+
+        // set_attested_signer and get_attested_signer.
+
+        #[test]
+        fn set_attested_signer_is_owner_only_with_one_yocto() {
+            let mut t = world();
+            let (address, model) = (fixture("signing_address"), fixture("model"));
+            assert_rejected(
+                try_set_signer(
+                    &mut t,
+                    "alice.test",
+                    SIGNER,
+                    "ecdsa",
+                    &address,
+                    &model,
+                    true,
+                ),
+                "E_OWNER",
+                "a stranger",
+            );
+            // Exactly 1 yoctoNEAR, which a function-call key cannot attach.
+            for deposit in [NearToken::from_yoctonear(0), NearToken::from_yoctonear(2)] {
+                testing_env!(ctx(OWNER).attached_deposit(deposit).build());
+                let call = || {
+                    t.set_attested_signer(
+                        SIGNER.to_string(),
+                        "ecdsa".to_string(),
+                        address.clone(),
+                        model.clone(),
+                        true,
+                    )
+                };
+                let message = panic_message(call).expect("refused");
+                assert!(message.contains("1 yoctoNEAR"), "{message}");
+            }
+            // The predecessor counts, not the signer.
+            testing_env!(ctx("evil.test")
+                .signer_account_id(acct(OWNER))
+                .attached_deposit(ONE_YOCTO)
+                .build());
+            let message = panic_message(|| {
+                t.set_attested_signer(
+                    SIGNER.to_string(),
+                    "ecdsa".to_string(),
+                    address.clone(),
+                    model.clone(),
+                    true,
+                )
+            })
+            .expect("refused");
+            assert!(message.starts_with("E_OWNER: "), "{message}");
+            assert_eq!(t.get_attested_signer(SIGNER.to_string()), None);
+            assert!(get_logs().is_empty());
+        }
+
+        #[test]
+        fn set_attested_signer_checks_its_arguments() {
+            let mut t = world();
+            let (address, model) = (fixture("signing_address"), fixture("model"));
+            let long_id = "a".repeat(65);
+            let long_model = "m".repeat(129);
+            let cases: [(&str, &str, &str, &str, &str); 13] = [
+                ("", "ecdsa", &address, &model, "signer_id must be"),
+                (&long_id, "ecdsa", &address, &model, "signer_id must be"),
+                ("Upper", "ecdsa", &address, &model, "signer_id must be"),
+                ("a b", "ecdsa", &address, &model, "signer_id must be"),
+                (
+                    SIGNER,
+                    "ed25519",
+                    &address,
+                    &model,
+                    "algo must be \\\"ecdsa\\\"",
+                ),
+                (SIGNER, "ECDSA", &address, &model, "algo must be"),
+                (SIGNER, "", &address, &model, "algo must be"),
+                (SIGNER, "ecdsa", &address[2..], &model, "Ethereum address"),
+                (SIGNER, "ecdsa", &address[..41], &model, "Ethereum address"),
+                (
+                    SIGNER,
+                    "ecdsa",
+                    "0xzz5ab53d20294ef795906dff21ae4c045336aa26",
+                    &model,
+                    "Ethereum address",
+                ),
+                (SIGNER, "ecdsa", &address, "", "model must be"),
+                (SIGNER, "ecdsa", &address, &long_model, "model must be"),
+                (SIGNER, "ecdsa", &address, "Qwen:Qwen", "model must be"),
+            ];
+            for (id, algo, addr, m, detail) in cases {
+                let message = assert_rejected(
+                    try_set_signer(&mut t, OWNER, id, algo, addr, m, true),
+                    "E_ATTESTATION",
+                    detail,
+                );
+                assert!(
+                    message.contains(detail),
+                    "{message:?} does not say {detail:?}"
+                );
+            }
+            // The longest id and model are accepted.
+            let longest_id = "a".repeat(64);
+            let longest_model = "m".repeat(128);
+            try_set_signer(
+                &mut t,
+                OWNER,
+                &longest_id,
+                "ecdsa",
+                &address,
+                &longest_model,
+                true,
+            )
+            .unwrap();
+            assert!(t.get_attested_signer(longest_id).is_some());
+            assert_eq!(t.get_attested_signer(SIGNER.to_string()), None);
+        }
+
+        #[test]
+        fn a_signer_reads_back_lowercase_and_the_owner_pays_for_it() {
+            let mut t = world();
+            let start = used(&t, OWNER);
+            // A checksummed (mixed-case) address is stored lowercase.
+            let mixed = "0x835AB53d20294Ef795906dfF21aE4c045336AA26";
+            let model = fixture("model");
+            try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", mixed, &model, true).unwrap();
+            assert!(get_logs().is_empty(), "admin methods log nothing");
+            let view = AttestedSignerView {
+                signer_id: SIGNER.to_string(),
+                algo: "ecdsa".to_string(),
+                address: fixture("signing_address"),
+                model: model.clone(),
+                enabled: true,
+            };
+            assert_eq!(
+                t.get_attested_signer(SIGNER.to_string()),
+                Some(view.clone())
+            );
+            assert_eq!(
+                serde_json::to_value(&view).unwrap(),
+                json!({
+                    "signer_id": SIGNER,
+                    "algo": "ecdsa",
+                    "address": "0x835ab53d20294ef795906dff21ae4c045336aa26",
+                    "model": "Qwen/Qwen3.8-27B",
+                    "enabled": true,
+                })
+            );
+            // 40 bytes of record overhead, the key (1-byte prefix and the id) and the value (a
+            // 1-byte algo, 20-byte address, 4-byte length and the model, a 1-byte flag).
+            let bytes = (40 + 1 + SIGNER.len() + 1 + 20 + 4 + model.len() + 1) as u64;
+            assert_eq!(used(&t, OWNER), start + bytes);
+            // Replacing it with a shorter model gives back the difference.
+            try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", mixed, "m", false).unwrap();
+            assert_eq!(used(&t, OWNER), start + bytes - (model.len() as u64 - 1));
+            assert!(!t.get_attested_signer(SIGNER.to_string()).unwrap().enabled);
+            // An id that could not be registered reads as none.
+            assert_eq!(t.get_attested_signer("Not Valid".to_string()), None);
+            assert_eq!(t.get_attested_signer(String::new()), None);
+        }
+
+        #[test]
+        fn set_attested_signer_needs_the_owners_storage() {
+            let mut t = fresh();
+            let (address, model) = (fixture("signing_address"), fixture("model"));
+            let message = assert_rejected(
+                try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", &address, &model, true),
+                "E_STORAGE",
+                "an owner with no storage balance",
+            );
+            // On chain the failed call rolls back the record; the mocked chain keeps what was
+            // written before the panic, so only the refusal is checked here.
+            assert_eq!(message, "E_STORAGE: not registered");
+        }
+
+        /// The arguments of `pick_attested` as they arrive in JSON; `#[deny_unknown_arguments]`
+        /// makes them `deny_unknown_fields`, and each attestation goes through its own derive.
+        #[derive(near_sdk::serde::Deserialize, Debug)]
+        #[serde(crate = "near_sdk::serde", deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PickAttestedInput {
+            task_id: U64,
+            winners: Vec<WinnerArg>,
+            scorecard_hash: String,
+            scorecard_uri: String,
+            attestations: Vec<AttestationArg>,
+        }
+
+        #[test]
+        fn pick_attested_args_wire_form() {
+            let good = json!({
+                "task_id": "1",
+                "winners": [{"account": "bob.test", "bps": 10000}],
+                "scorecard_hash": SCORECARD_HASH,
+                "scorecard_uri": SCORECARD_URI,
+                "attestations": [{"signer_id": SIGNER, "text": "t", "signature": "s"}],
+            });
+            let parsed: PickAttestedInput = serde_json::from_value(good.clone()).unwrap();
+            assert_eq!(parsed.attestations[0].signer_id, SIGNER);
+            let mut extra_top = good.clone();
+            extra_top["attestation"] = json!({});
+            assert!(serde_json::from_value::<PickAttestedInput>(extra_top).is_err());
+            let mut extra_inner = good.clone();
+            extra_inner["attestations"][0]["signing_address"] = json!("0x00");
+            assert!(serde_json::from_value::<PickAttestedInput>(extra_inner).is_err());
+            let mut missing = good;
+            missing["attestations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("signature");
+            assert!(serde_json::from_value::<PickAttestedInput>(missing).is_err());
         }
     }
 }

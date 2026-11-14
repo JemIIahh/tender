@@ -279,6 +279,21 @@ pub(crate) struct Refund {
     pub amount: U128,
 }
 
+/// Data of `attested_pick`, logged once per attestation right after the `picked` or `voided` of a
+/// `pick_attested`: the registered signer `signer_id` signed, for `model`, that the model answered
+/// the request whose SHA-256 is `request_hash` with the response whose SHA-256 is
+/// `response_hash` (each 64 lowercase hex characters). The id is a decimal string.
+#[cfg(feature = "attested")]
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct AttestedPick {
+    pub task_id: U64,
+    pub signer_id: String,
+    pub model: String,
+    pub request_hash: String,
+    pub response_hash: String,
+}
+
 #[cfg(test)]
 mod tests {
     use near_sdk::serde;

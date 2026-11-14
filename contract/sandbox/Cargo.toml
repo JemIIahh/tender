@@ -24,3 +24,6 @@ sha2 = "=0.10.9"
 near-primitives = "=0.37.4"
 near-crypto = "=0.37.4"
 near-jsonrpc-client = "=0.22.0"
+# The attested-pick suite signs texts with secp256k1 keys of its own (near-crypto) and computes
+# their EIP-191 digests and Ethereum addresses with keccak-256. The version already in Cargo.lock.
+sha3 = "=0.10.9"
