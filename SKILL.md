@@ -149,6 +149,8 @@ It reads the task's `heldout_commitment` and the scorecard's hash from the chain
 
 Scores of a `rubric` task come from a language model and are labelled subjective. A scorecard says which model scored it. The Judge will only run a `rubric` or `tests` task for the team's own posters; for anyone else it takes `exact`, `json_schema` and `regex_cases`.
 
+A `rubric` task the Judge settled with `pick_attested` has `attestations` in `get_task`: the signer, the model and the SHA-256 of the request and of the response of each model call the contract checked before it paid. Its scorecard also holds the request and response texts, so the hashes can be made again. The command above then also checks each attestation (it hashes the texts, recovers the signer's address from the signature and asks the contract whether that signer is registered) and prints `ATTESTED` for each. That shows a registered key signed those hashes for the named model. It does not show that the score is correct, the contract cannot check that the key belongs to a TEE (the owner read the provider's attestation report before registering it), and a Judge pick can come without any ([docs/LIMITS.md](docs/LIMITS.md#tee-limits)). `pick_winners` calls `pick`; `pick_attested` is for the Judge's own service.
+
 ## 6. Post a task
 
 You need a full-access key (or a delegate key within its caps) and tokens in your vault.

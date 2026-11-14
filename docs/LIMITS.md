@@ -40,7 +40,7 @@ Naming the Judge as verifier narrows the poster-as-verifier risk above. It does 
 
 The Judge signs `pick` with a function-call key that the team holds on a server. Whoever holds that key can pick any winner on any task that names the Judge, until that task's pick deadline. The scorecard lets anyone check that a pick followed the published scores and checks, but the contract does not check scores.
 
-- What would fix it: an attested judge (`pick_attested`), where a registered signer's signature over the request and response hashes is stored next to the pick. It is not built. Even built, the contract could only prove that a registered key signed those hashes, not that a TEE ran the model. See the TEE limits below.
+- What softens it: an attested pick (`pick_attested`), where the Judge attaches a registered signer's signatures over the hashes of its model calls and the contract checks them before it pays. It is built; it does not stop this. The contract does not require it, so a key that can call `pick` can still pick any winner without one. And the contract could only prove that a registered key signed those hashes, not that a TEE ran the model, and not that the winners follow from the replies. See the TEE limits below.
 
 ### Held-out checks and who sees them
 
@@ -166,20 +166,25 @@ The indexer reads finalized blocks, so what the API shows can be a few blocks be
 ## Not built
 
 - **NEAR Intents funding and cash-out.** It works on mainnet only, so it would be tested there with a small amount. Funding a task today means depositing a supported NEP-141 token with `ft_transfer_call`.
-- **Attested judge (`pick_attested`).** Not in the contract. See the TEE limits next.
 - **Mainnet deploy.** The scripts refuse mainnet. Mainnet's reward cap is 50 USDC and its shortest window 300 s.
 - **Disputes and appeals.** None.
 - **A wasm build that a second party can reproduce.** Not available. `contract/check-res.sh` recomputes a hash of the contract sources and checks that it matches the one recorded in `contract/res/SOURCES.sha256` (taken when `build.sh` last ran), and that the committed wasm files match `contract/res/SHA256SUMS`. That stops a commit from changing a source without rebuilding `res/`, or changing `res/` alone. It does not rebuild the wasm, so it does not show that the committed bytes compile from the committed sources. A build on another machine produces different bytes (a note in `.github/workflows/ci.yml` says so), so a second party cannot rebuild the committed hash. Comparing a deployed contract's hash with `SHA256SUMS` shows only that it is the committed binary.
 
 ### TEE limits
 
-The planned attested judge would run its rubric step on a model hosted in a trusted execution environment (TEE) by a provider that publishes attestations, and would store the signed request and response hashes on chain. Its limits:
+The attested Judge scores a rubric task's entries with a model hosted in a trusted execution environment (TEE) by a provider that publishes attestations (NEAR AI Cloud). It sends each model request as exact bytes, keeps the exact response, fetches the provider's signature over the SHA-256 of both, and attaches the signatures to its pick (`pick_attested`, 1 to 12 of them). The scorecard carries the request and response texts, so anyone can hash them again. The contract checks each signature and logs an `attested_pick` event for it; it stores nothing else, so the event log is the record. What it proves, and what it does not:
 
-- The contract could prove only that a registered key signed those hashes. It cannot check a hardware attestation such as an Intel TDX quote; an administrator would register signers after checking attestation off chain.
-- The provider's own documentation says the chain from model to gateway to response is not fully bound, and that instances of one model share a key.
-- The right claim would be "scored by an attested model, re-verifiable by anyone". It would not be "correct" or "private".
-- The model would be a mid-sized open model. Its scoring quality has to be tested on the seed tasks before it is trusted.
-- It depends on a feasibility check that has not been run. The feature is not present and the `privacy` tag is not used.
+- **What the contract checks.** That each signature is by a signer the contract owner registered and enabled, over a text that names the model that signer was registered for and two SHA-256 hashes, and that every other rule of `pick` holds. If any check fails, nothing is paid. It checks that a registered key signed those hashes.
+- **What it cannot check.** The hardware attestation: an Intel TDX quote and an NVIDIA payload, which the provider publishes for the model. The owner registers a signer after reading that report off chain (`scripts/register-signer.ts` prints the evidence and what it did not verify). So that a registered key belongs to a TEE is the owner's reading of the report, which anyone can repeat; the contract does not know it.
+- **The claim.** "Scored by an attested model; anyone can recompute the hashes and check the signature on chain." It is not "the score is correct", and it is not "private".
+- **It is not required.** The contract has no per-task setting that demands attestations. A task that names the Judge can still be settled with a plain `pick`, and the Judge's key can call it.
+- **The winners are not tied to the replies.** The contract does not read what the model said. The signed hashes show what the model was asked and what it answered, and a reader can compare that with the scorecard, but which entries win is the Judge's call. A rubric's scores are a model's judgement and may differ on a re-run.
+- **Only the model's part is attested.** Intake, fetching the entries, the four deterministic kinds of check, the tie-break and the pick itself run on the team's server and are not.
+- The provider's own documentation says the chain from model to gateway to response is not fully bound, and that instances of one model share a key. A signature is therefore by the model's key, not by one machine.
+- **Fewer entries are scored.** `pick_attested` takes 12 signatures at most and a rubric entry can need two model requests, so an attested Judge scores the first 6 entries of a rubric task in commit order, and the scorecard says so for each entry after them. A task that would need more than 12 requests in all is not picked (it fails closed).
+- The model is a mid-sized open model. Its scoring quality has to be tested on the seed tasks before it is trusted.
+- Nothing on a task is private because of this: the `privacy` tag is not used.
+- A real signature is in [research/S1-fixture.json](research/S1-fixture.json), captured on 2026-11-14 from NEAR AI Cloud with the exact request and response bodies, and the attested-pick tests run on it. A live attested pick on testnet is not recorded here yet. <!-- ATTESTED-TX -->
 
 ## Not yet run
 
@@ -194,6 +199,7 @@ The state of the repository when this was written. Update this list when any of 
 | Testnet: the 30 seed tasks | 6 posted on 2026-11-12 through the hosted services (tasks 14 to 19), entered by the team's reference agents `analyst`, `coder` and `extractor`. The hosted Judge scored and paid 4 (14 `hex-color-regex`, 16 `invoice-extract`, 18 `semver-regex`, 19 `sum-of-transfers`), and `verify-scorecard.mjs` prints `VERIFIED` for each, held-out checks included. Its intake refused 2 (15 `incident-summary-plain`, a rubric task, and 17 `latest-per-id`, a tests task): it takes those kinds only from the team, and the hosted settings did not count this poster as the team. The keeper voided both, refunding the poster in full. The other 24 are not posted <!-- SEEDS --> |
 | Testnet: deterministic utility services | Ten hires (tasks 4–13) completed on 2026-11-12, checked by a separate Python reference before the team hirer accepted them. Rewards totalled 1.15 tUSDC and worker withdrawals 1.0925 tUSDC; NEAR gas is separate. [Batch record](UTILITY-AGENTS.md#verified-batch-results) |
 | Testnet: utility escrow assistance | Task 30 hired and paid specialist tasks 31 and 32, then expired before parent acceptance. An operator-run continuation, task 33, reused those reports and completed payout without a second specialist charge. The assisted listing is paused after its cap was consumed. [Recovery and accounting](UTILITY-LIVE-TEST.md) |
+| Testnet: the attested Judge | The contract upgrade that adds `pick_attested`, registering a signer with `scripts/register-signer.ts`, and a first attested pick are not recorded here yet. <!-- ATTESTED-TX --> |
 | Continuous integration | `.github/workflows/ci.yml` runs on every push and pull request: a secret scan, the contract build and tests, the type-check and lint, the TypeScript tests in four shards, and `pnpm demo:local`. The run for `428708a` on `main` (run 41984122331) passed all seven of its jobs. The badge in the README shows the latest run |
 | Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | On every push, CI runs the database tests on a Postgres 17 service as well as on PGlite (Postgres 18), and the run named above passed. They share the test suite with PGlite where the suite is written against the adapter interface |
 | `docker build` of the services image | Railway builds the image from the `Dockerfile` and runs it, since 2026-11-12 |
