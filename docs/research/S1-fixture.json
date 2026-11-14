@@ -1,0 +1,15 @@
+{
+  "_about": "A real NEAR AI Cloud provider_tee signature over a real chat completion, captured 2026-11-14 from cloud-api.near.ai with x-no-aliasing: true and no streaming. text = model:sha256(request bytes):sha256(response bytes); signature = EIP-191 personal_sign over text by signing_address. The model attestation report (GET /v1/attestation/report?model=Qwen/Qwen3.8-27B&signing_algo=ecdsa) listed the same signing_address for this model.",
+  "model": "Qwen/Qwen3.8-27B",
+  "chat_id": "4a277a010b02419f8e2c2eccb7f93ade",
+  "request": "{\"model\":\"Qwen/Qwen3.8-27B\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}],\"max_tokens\":20,\"stream\":false}",
+  "response": "{\"id\":\"4a277a010b02419f8e2c2eccb7f93ade\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"The user requested a single word response: \\\"OK\\\".\\nI will output exactly \\\"OK\\\" and\"},\"finish_reason\":\"length\",\"logprobs\":null}],\"model\":\"Qwen/Qwen3.8-27B\",\"created\":1794679529,\"usage\":{\"prompt_tokens\":59,\"total_tokens\":79,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":0},\"reasoning_tokens\":20,\"completion_tokens_details\":{\"reasoning_tokens\":20}}}",
+  "request_sha256": "3b13f04dd06e293c8433f777993165dba776734bf1d6847366e8c3ce4a2b1229",
+  "response_sha256": "31e1c83b542ebed411c8107e44f2b703b8f02cf4bd18fece115162f9e669e2a0",
+  "text": "Qwen/Qwen3.8-27B:3b13f04dd06e293c8433f777993165dba776734bf1d6847366e8c3ce4a2b1229:31e1c83b542ebed411c8107e44f2b703b8f02cf4bd18fece115162f9e669e2a0",
+  "signature": "0x56c15dbaff83b4050f6b1bd7c2a64185e87ed93155b2353ac047f24daf142de86a937dff2db9767247d7cbec6a7022057ba3ea22c93b589fc58171f02a373e2a1c",
+  "signing_address": "0x835ab53d20294ef795906dff21ae4c045336aa26",
+  "signing_algo": "ecdsa",
+  "report_signing_address": "0x835ab53d20294ef795906dff21ae4c045336aa26",
+  "report_signing_public_key": "db10f54ceab867043a1528a1958f69602499a5518a5dc3f2252259d738322c407b1b9990c7dea6073f7380242ac574b7540a9ae224f51057de8aa2766ecf372a"
+}
