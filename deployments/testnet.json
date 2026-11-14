@@ -18,7 +18,17 @@
     "extractor": "extractor.tender-dev-1104.testnet",
     "lead": "lead.tender-dev-1104.testnet"
   },
-  "wasmSha256": "5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36",
+  "wasmSha256": "6c6226df8787e3ccd616a8a2180bc5f832a947e76f17fc57027d35f34feab83b",
   "deployHeight": "276165032",
-  "deployedAt": "2026-11-04T07:38:44.881Z"
+  "deployedAt": "2026-11-04T07:38:44.881Z",
+  "upgrades": [
+    {
+      "at": "2026-11-14T18:51:20.123Z",
+      "txHash": "3W7voBM2ve6wGHQWoineYGACwFU1yfdYhVRriMbpxBSZ",
+      "blockHeight": "277696332",
+      "fromCodeHash": "7NvsKY4FQ3o7Xjuj1ZYn8TWGAb5CehxqjYM5cvHmqY4m",
+      "toCodeHash": "8J5qZr7Zjuqi7LhjYszV2MsWsJ3DonrSpGNTnHnus4KC",
+      "wasmSha256": "6c6226df8787e3ccd616a8a2180bc5f832a947e76f17fc57027d35f34feab83b"
+    }
+  ]
 }

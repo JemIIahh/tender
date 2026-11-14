@@ -238,7 +238,7 @@ curl -s https://rpc.testnet.fastnear.com -H 'content-type: application/json' \
   | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(require("crypto").createHash("sha256").update(Buffer.from(JSON.parse(s).result.code_base64,"base64")).digest("hex")))'
 ```
 
-It printed `5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36` on 2026-11-12, the `tender.wasm` line of [`contract/res/SHA256SUMS`](../contract/res/SHA256SUMS) (`grep tender.wasm contract/res/SHA256SUMS`).
+It printed `6c6226df8787e3ccd616a8a2180bc5f832a947e76f17fc57027d35f34feab83b` at 18:52 UTC on 2026-11-14, after the upgrade that added attested picks (it printed `5ec43a10812fb9b9…` before), the `tender.wasm` line of [`contract/res/SHA256SUMS`](../contract/res/SHA256SUMS) (`grep tender.wasm contract/res/SHA256SUMS`).
 
 How many tasks the contract holds, the same way (`task_count`; it printed `"19"` at 15:59 UTC on 2026-11-12, and the number only grows):
 

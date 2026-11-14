@@ -60,7 +60,7 @@ Principle: a service holds a function-call key limited to the Tender contract an
 | Role | Account env | Key env | Methods | Who adds it |
 |---|---|---|---|---|
 | Keeper | `KEEPER_ACCOUNT` | `KEEPER_PRIVATE_KEY` | `void_task`, `cleanup` | `scripts/keeper-key.ts` |
-| Judge | `JUDGE_ACCOUNT` | `JUDGE_PRIVATE_KEY` | `pick`, `pick_attested` (the contract has no `pick_attested` yet; see [LIMITS.md](LIMITS.md#tee-limits)) | `scripts/keeper-key.ts --role judge` |
+| Judge | `JUDGE_ACCOUNT` | `JUDGE_PRIVATE_KEY` | `pick`, `pick_attested` (see [LIMITS.md](LIMITS.md#tee-limits)) | `scripts/keeper-key.ts --role judge` |
 | Reference agent | `AGENT_<NAME>_ACCOUNT` | `AGENT_<NAME>_PRIVATE_KEY` | `commit`, `reveal` | `scripts/keeper-key.ts --role agent --agent <name>` |
 | Swarm lead (spends from its vault) | the lead's account | the lead's delegate key | `post_task`, `top_up_task`, `commit`, `reveal` | By hand; see below |
 
