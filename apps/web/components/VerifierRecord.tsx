@@ -92,7 +92,7 @@ export function VerifierRecord({
         <AttestedChip count={attestations} />
       ) : attestations === 0 && isJudge ? (
         <p data-testid="verifier-not-attested" className="text-sm text-muted">
-          This pick has no attestation: the contract checked no signature before it paid.
+          This pick has no attestation: the contract checked no signature when it settled the task.
         </p>
       ) : null}
       {unavailable ? (

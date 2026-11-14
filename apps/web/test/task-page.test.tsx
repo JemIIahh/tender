@@ -1163,8 +1163,40 @@ test("task_page_has_no_attested_mark_on_a_pick_without_signatures", async () => 
   expect(screen.queryByTestId("attested-chip")).toBeNull();
   // On a pick the Judge made, the Checker card says that the pick has none.
   expect(screen.getByTestId("verifier-not-attested").textContent).toBe(
-    "This pick has no attestation: the contract checked no signature before it paid.",
+    "This pick has no attestation: the contract checked no signature when it settled the task.",
   );
+});
+
+test("task_page_does_not_call_a_void_by_the_keeper_or_the_posters_pick_an_unattested_judge_pick", async () => {
+  pinClock(AT.fallback + 60n * SECOND);
+  // Nobody picked: the keeper voided it (`by` is null), and the poster picked in the fallback
+  // window. Neither is a pick by the Judge, so the card says nothing of attestations.
+  const outcomes: TaskOutcome[] = [
+    {
+      kind: "voided",
+      task_id: "7",
+      reason: "expired",
+      by: null,
+      refunds: [{ account: POSTER, amount: "1500000" }],
+      scorecard_hash: null,
+      scorecard_uri: null,
+    },
+    { ...picked, by: POSTER },
+  ];
+  for (const outcome of outcomes) {
+    fakeApi(
+      routes(() =>
+        detail(
+          { phase: "settled", outcome_kind: outcome.kind, outcome },
+          { attestations: [], scorecard: null },
+        ),
+      ),
+    );
+    await open("7", { judgeAccount: VERIFIER });
+    expect(screen.queryByTestId("verifier-not-attested"), outcome.kind).toBeNull();
+    expect(screen.queryByTestId("attested")).toBeNull();
+    cleanup();
+  }
 });
 
 test("task_page_claims_nothing_about_signatures_when_the_api_says_nothing_of_them", async () => {

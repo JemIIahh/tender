@@ -186,10 +186,15 @@ function ReadyView({
 }) {
   const { task, brief, criteria, entries, funders, children, scorecard } = loaded.data;
   // The signatures the contract checked before it paid. An API from before the field says nothing,
-  // which is not the same as saying there were none.
+  // which is not the same as saying there were none. "None" is said of a pick the verifier made, and
+  // not of a void by the keeper or a pick by the poster in the fallback window.
   const attestations = loaded.data.attestations ?? [];
   const attestedCount =
-    task.outcome === null || loaded.data.attestations === undefined ? null : attestations.length;
+    task.outcome === null || loaded.data.attestations === undefined
+      ? null
+      : attestations.length > 0 || task.outcome.by === task.verifier
+        ? attestations.length
+        : null;
   // The phase by the clock, so that a window ends on the page when it ends in the contract.
   const phase = phaseOfTask(task, nowNs);
   const scorecardHash = task.outcome?.scorecard_hash ?? null;
