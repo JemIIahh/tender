@@ -78,9 +78,14 @@ pub async fn new_account(env: &Env, name: &'static str) -> anyhow::Result<Accoun
 /// - alice, bob and carol are registered agents, so they may enter open tasks. No agent bond is
 ///   set, so they paid none; the cooldown is the contract's default.
 pub async fn setup(min_window_secs: u32) -> anyhow::Result<Env> {
+    setup_with(min_window_secs, read_wasm(TENDER_WASM)?).await
+}
+
+/// `setup`, with `tender_wasm` deployed as Tender in place of `res/tender.wasm`: the upgrade suite
+/// starts from the build that testnet runs.
+pub async fn setup_with(min_window_secs: u32, tender_wasm: Vec<u8>) -> anyhow::Result<Env> {
     let worker = near_workspaces::sandbox().await?;
     let root = worker.root_account()?;
-    let tender_wasm = read_wasm(TENDER_WASM)?;
     let token_wasm = read_wasm(TOKEN_WASM)?;
 
     let names = [
