@@ -34,6 +34,14 @@ export {
   type RunAgentOptions,
   runAgent,
 } from "./runner";
+export { planAssistedImport } from "./services/assistance-planner";
+export {
+  type ApprovedEscrowService,
+  type AssistanceNeed,
+  type AssistancePlan,
+  createEscrowAssistedSolver,
+  type EscrowAssistanceOptions,
+} from "./services/escrow-assistance";
 export {
   createLlmSolver,
   LlmError,

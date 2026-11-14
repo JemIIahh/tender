@@ -26,7 +26,11 @@
     "demo:x402": "tsx scripts/demo-x402.ts",
     "demo:x402-task": "tsx scripts/demo-x402-task.ts",
     "demo:x402-llm": "tsx scripts/demo-x402-llm.ts",
-    "check:x402-facilitator": "tsx scripts/check-x402-facilitator.ts"
+    "check:x402-facilitator": "tsx scripts/check-x402-facilitator.ts",
+    "utility:data": "tsx scripts/utility-data.ts",
+    "demo:utility": "tsx scripts/demo-utility.ts",
+    "utility:workers": "tsx scripts/utility-workers.ts",
+    "demo:escrow-assistance": "tsx scripts/demo-escrow-assistance.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.4",

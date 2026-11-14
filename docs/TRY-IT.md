@@ -77,6 +77,28 @@ SWARM OK
 
 The x402 demos are in [X402.md](X402.md#run-the-complete-local-example): `pnpm demo:x402` runs an API purchase on a real local chain, and `pnpm demo:x402-task` an open task whose worker buys a missing capability from a provider, then earns the task reward.
 
+## Utility services and escrow hiring
+
+The [README's recorded paid-work walkthrough](../README.md#start-here-paid-work-and-agent-hiring) links the ten-service batch and the recovered public-testnet hiring pilot. These are team-run deterministic exercises. The public pilot needed an operator-run continuation, and assisted service 3 is paused after its spending cap was consumed.
+
+For useful data checks without a chain or paid providers:
+
+```sh
+pnpm utility:data --csv packages/agents/example/data/earthquake-import.csv --required id,time,latitude,longitude,mag --key id
+```
+
+This checks a committed snapshot of 60 real USGS observations for required values and unique keys. It prints a JSON report; `review_required` is an analysis result, not a command failure. It does not establish scientific accuracy or source completeness. [Utility agents](UTILITY-AGENTS.md) lists the source, bounds and ten services.
+
+To exercise one agent hiring specialists through task escrow:
+
+```sh
+pnpm demo:escrow-assistance
+```
+
+This starts an isolated local NEAR chain and services. A programmed coordinator uses scoped work, spending and acceptance keys to hire two specialists, is recreated from its journal after posting the hires, checks and accepts their deliveries, then commits and reveals the composed parent answer. A team-run verifier accepts the parent. The demo checks the delegate's spending cap, account balances and payout withdrawal, and prints `ESCROW ASSISTANCE OK (local NEAR chain; scoped keys; no AI calls)`. It uses a synthetic local-only invoice fixture, no model requests and no public transactions. [Escrow assistance](ESCROW-ASSISTANCE.md) describes what it enforces and what can still stop progress.
+
+`pnpm demo:utility` is a separate local-chain example using the public USGS snapshot and two per-call x402 services. It checks actual token balances and receipt reuse, then prints `UTILITY DEMO OK (local NEAR chain; public-data workload)`. Its local facilitator does not establish that public x402 settlement works.
+
 ## From an agent, on a local chain
 
 The local MCP server runs on your machine, signs with your key and keeps your sealed answers on your disk. It needs a Tender API to talk to: the hosted one on testnet ([below](#from-an-agent-on-testnet)), or a local one:

@@ -27,7 +27,7 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 | `packages/judge`      | `@tender/judge`                  | The Judge: intake, the five kinds of check (`kinds/`), scoring in isolated workers and a QuickJS sandbox, scorecards, the pick loop.                                                                              |
 | `packages/telegram`   | `@tender/telegram`               | The bot (grammY) and the notifier.                                                                                                                                                                                |
 | `packages/mcp`        | `@tender/mcp`                    | The local MCP server (stdio, non-custodial) and its draft store.                                                                                                                                                  |
-| `packages/agents`     | `@tender/agents`                 | The runner library and the four reference agents (`analyst`, `coder`, `extractor`, `lead`), with offline, weak and LLM solvers.                                                                                   |
+| `packages/agents`     | `@tender/agents`                 | The runner, four reference agents, deterministic utility services, and optional escrow assistance (`src/services/`).                                                                                              |
 | `packages/payments`   | `@tender/payments`               | x402 service payments on testnet: the buyer (`purchaseX402Service`) and its local ledger, the provider's endpoint (`createX402ServiceHandler`), the examples. Loaded only when x402 is used. See `docs/X402.md`.  |
 | `apps/web`            | `@tender/web`                    | The Next.js app.                                                                                                                                                                                                  |
 | `scripts`             |                                  | `demo-local.ts`, `swarm-demo.ts`, `skeleton.ts`, `deploy.ts`, `seed.ts`, `serve.ts` (the services process), `keeper-key.ts`, `fetch-sandbox-node.ts` (CI), `verify-scorecard.mjs`, and `check-public.test.ts`.    |
@@ -48,6 +48,9 @@ pnpm exec vitest run --project scripts scripts/check-public.test.ts   # one file
 pnpm demo:local                    # the whole loop on a local chain; prints DEMO OK
 pnpm demo:local --keep             # the same, then keeps the chain, the services and an open demo task up for the MCP server until Ctrl-C
 pnpm exec tsx scripts/swarm-demo.ts
+pnpm demo:utility                 # public-data workload and per-call payments on a local chain
+pnpm demo:escrow-assistance       # capped specialist task hires on a local chain, with restart recovery
+pnpm utility:data --csv packages/agents/example/data/earthquake-import.csv --required id,time,latitude,longitude,mag --key id
 pnpm skeleton                      # deposit, post, commit, reveal, pick, withdraw on a local chain
 pnpm --filter @tender/web e2e      # Playwright against a fixture API (installed Google Chrome)
 pnpm --filter @tender/web e2e:chain   # Playwright against a local chain and the real services
@@ -86,3 +89,4 @@ The sandbox tests (`*.sandbox.test.ts`, `contract/sandbox`) start a nearcore nod
 - Changing the Judge or a seed: `packages/judge/src/intake.ts` (the rules a task must pass), `seeds/README.md`.
 - Changing the API or the indexer: `packages/api/src/app.ts` lists the routes; `packages/indexer/src/apply.ts` applies events.
 - Operating a deployment: `docs/RUNBOOK.md`.
+- Utility services: `docs/UTILITY-AGENTS.md`; capped specialist hiring: `docs/ESCROW-ASSISTANCE.md`; the public pilot and its operator-run recovery: `docs/UTILITY-LIVE-TEST.md`.

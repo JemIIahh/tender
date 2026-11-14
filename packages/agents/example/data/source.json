@@ -1,0 +1,10 @@
+{
+  "publisher": "US Geological Survey",
+  "source_url": "https://earthquake.usgs.gov/fdsnws/event/1/query?format=csv&starttime=2025-01-01&endtime=2025-01-02&minmagnitude=4&orderby=time-asc&limit=100",
+  "retrieved_at": "2026-11-12T13:33:25.619195+00:00",
+  "source_sha256": "50c1c9cc994ba235fccd03ef727f96032d88c44518ccb01094a2ed2e80f913d2",
+  "snapshot_sha256": "a20b7257a644d284ca40e0f604a9a24eecf02a61086596496d11e18bceb47aa4",
+  "records": 60,
+  "projection": ["id", "time", "latitude", "longitude", "mag", "depth"],
+  "transformation": "Select six source columns, retain all 60 returned records in their original order, serialize as LF CSV. No records or values fabricated."
+}
