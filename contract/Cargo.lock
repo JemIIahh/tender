@@ -3705,6 +3705,7 @@ dependencies = [
  "near-contract-standards",
  "near-sdk",
  "proptest",
+ "secp256k1",
 ]
 
 [[package]]

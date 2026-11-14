@@ -15,6 +15,13 @@ hex = "0.4"
 [dev-dependencies]
 near-sdk = { version = "=5.29.1", features = ["unit-testing"] }
 proptest = "1"
+# Signs test texts for `pick_attested` with keys the tests make. The version near-crypto already
+# brings in (Cargo.lock), with its `recovery` feature.
+secp256k1 = { version = "=0.27.0", features = ["recovery"] }
 
 [features]
+# `attested` builds `set_attested_signer`, `get_attested_signer` and `pick_attested`
+# (src/attest.rs), which need near-sdk's `env::ecrecover`, behind its `unstable` feature. It is on
+# by default, so `cargo test` and clippy cover it, and build.sh names it for the release wasm.
+default = ["attested"]
 attested = ["near-sdk/unstable"]
