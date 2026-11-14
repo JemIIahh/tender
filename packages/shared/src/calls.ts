@@ -41,6 +41,7 @@ export const GAS = {
   commit: 15n * TGAS,
   reveal: 15n * TGAS,
   pick: 60n * TGAS,
+  pickAttested: 150n * TGAS,
   voidTask: 60n * TGAS,
   cleanup: 150n * TGAS,
   withdraw: 50n * TGAS,
@@ -56,6 +57,7 @@ export const GAS = {
   mint: 15n * TGAS,
   addDelegate: 15n * TGAS,
   removeDelegate: 15n * TGAS,
+  setAttestedSigner: 15n * TGAS,
 } as const;
 
 /**
@@ -241,6 +243,64 @@ export function pickCall(
     },
     gas: GAS.pick,
     deposit: NO_DEPOSIT,
+  };
+}
+
+/**
+ * `pick_attested`: settles a task as `pick` does, under every rule of `pick`, after the contract
+ * checks each attestation: a TEE signature by a signer the owner registered (`set_attested_signer`)
+ * over `"{model}:{request sha256}:{response sha256}"`. 1 to 12 attestations; any that fails and
+ * nothing is paid. Each is rebuilt as `{ signer_id, text, signature }`, the fields the contract
+ * takes. No deposit. The gas covers `pick` and twelve signature checks.
+ */
+export function pickAttestedCall(
+  contractId: string,
+  taskId: bigint,
+  winners: readonly { account: string; bps: number }[],
+  scorecardHash: string,
+  scorecardUri: string,
+  attestations: readonly { signer_id: string; text: string; signature: string }[],
+): TenderCall {
+  return {
+    receiverId: contractId,
+    methodName: "pick_attested",
+    args: {
+      task_id: taskId.toString(),
+      winners: winners.map(({ account, bps }) => ({ account, bps })),
+      scorecard_hash: scorecardHash,
+      scorecard_uri: scorecardUri,
+      attestations: attestations.map(({ signer_id, text, signature }) => ({
+        signer_id,
+        text,
+        signature,
+      })),
+    },
+    gas: GAS.pickAttested,
+    deposit: NO_DEPOSIT,
+  };
+}
+
+/**
+ * `set_attested_signer`, owner only: registers (or changes, or with `enabled` false turns off) the
+ * TEE key `pick_attested` accepts as `signerId`. `algo` is `ecdsa`, the only one built, and `address`
+ * the key's Ethereum-style address from the model's attestation report. 1 yoctoNEAR.
+ */
+export function setAttestedSignerCall(
+  contractId: string,
+  input: { signerId: string; address: string; model: string; enabled: boolean },
+): TenderCall {
+  return {
+    receiverId: contractId,
+    methodName: "set_attested_signer",
+    args: {
+      signer_id: input.signerId,
+      algo: "ecdsa",
+      public_key_or_address: input.address,
+      model: input.model,
+      enabled: input.enabled,
+    },
+    gas: GAS.setAttestedSigner,
+    deposit: ONE_YOCTO,
   };
 }
 

@@ -98,9 +98,12 @@ test("the_guard_sees_each_kind_of_name_it_looks_for", () => {
 });
 
 test("the_judge_is_given_no_way_to_the_board", () => {
-  // The chain the Judge reads and settles on has these three calls and no other: a `listQuestions`
-  // here would put the board within reach of every scorer that holds the client.
-  expectTypeOf<keyof JudgeChain>().toEqualTypeOf<"getTask" | "getAllEntries" | "pick">();
+  // The chain the Judge reads and settles on has these calls and no other (`pickAttested` is the
+  // attested Judge's `pick`): a `listQuestions` here would put the board within reach of every
+  // scorer that holds the client.
+  expectTypeOf<keyof JudgeChain>().toEqualTypeOf<
+    "getTask" | "getAllEntries" | "pick" | "pickAttested"
+  >();
   // Its other dependencies are the database, the network and its settings, as before. The field
   // list is spelled out so that a new one is a change to this test, and is read for what it is.
   expectTypeOf<keyof JudgeDeps>().toEqualTypeOf<
@@ -111,6 +114,7 @@ test("the_judge_is_given_no_way_to_the_board", () => {
     | "publicUrl"
     | "resultUploaded"
     | "llm"
+    | "attested"
     | "now"
     | "fetchIo"
     | "scoringLimits"
