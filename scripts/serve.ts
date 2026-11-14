@@ -360,7 +360,7 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  *   one, has 8 characters or more, and off the sandbox is neither its user name nor `postgres`,
  *   `password` or `tender`), which must all be set;
  * - `API_PORT` (or `PORT`, which is read only when `API_PORT` is unset, and is checked the same
- *   way), `INDEXER_POLL_MS`, `KEEPER_INTERVAL_MS`, `JUDGE_INTERVAL_MS`, `INDEXER_START_HEIGHT` and
+ *   way), `INDEXER_POLL_MS`, `INDEXER_MIN_POLL_MS`, `KEEPER_INTERVAL_MS`, `JUDGE_INTERVAL_MS`, `INDEXER_START_HEIGHT` and
  *   `TRUSTED_PROXY_HOPS`, which must be whole numbers in plain decimal digits, each in its range;
  * - `PUBLIC_API_URL`, the exact base URL clients call, which sign-in is bound to: it must be set
  *   off the sandbox, be an http(s) URL with no query, fragment or credentials, and have the one
@@ -448,6 +448,7 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     whole(portKey, 0, 65_535, "a whole number from 0 to 65535 (0 picks a free port)") ??
     DEFAULT_API_PORT;
   whole("INDEXER_POLL_MS", 1, MAX_TIMER_MS, milliseconds);
+  whole("INDEXER_MIN_POLL_MS", 1, MAX_TIMER_MS, milliseconds);
   const keeperIntervalMs = whole("KEEPER_INTERVAL_MS", 1, MAX_TIMER_MS, milliseconds);
   const judgeIntervalMs = whole("JUDGE_INTERVAL_MS", 1, MAX_TIMER_MS, milliseconds);
   const trustedProxyHops =

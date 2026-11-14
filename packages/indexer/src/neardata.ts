@@ -11,6 +11,14 @@ export interface NeardataOptions {
   /** Milliseconds to wait, once caught up, before asking for a newer final block. Default 1000. */
   pollMs?: number;
   /**
+   * The least time between two final-height polls, in milliseconds. Default 0: none. Caught up,
+   * the source asks for the final height again as soon as it has yielded the blocks up to the last
+   * one, so on a chain that makes a block every second or so it polls about once a block, and each
+   * poll is two requests. A floor of a few seconds lets each poll gather several blocks, which about
+   * halves the requests a caught-up source makes, for the cost of that much more lag.
+   */
+  minPollIntervalMs?: number;
+  /**
    * For tests. Default: the global `fetch`. A replacement must follow redirects, and drop
    * `Authorization` from one that leads to another origin, as WHATWG fetch does.
    */
@@ -56,7 +64,8 @@ type Stopped = typeof STOPPED;
  * is free, so at most `concurrency` requests are in flight, and about as many blocks are fetched
  * and waiting to be yielded (more while parents that were left out are fetched again: see below).
  * When it has yielded up to the final height it asks for it again: if that shows nothing new it
- * waits `pollMs` and asks once more, and so on until a newer block is final.
+ * waits `pollMs` and asks once more, and so on until a newer block is final. With
+ * `minPollIntervalMs`, two polls never start closer together than that.
  *
  * A block is left out only when neardata says there is none at that height (see `blockAt`) and the
  * chain agrees. Every block names its parent (`prev_height`), so a block whose parent was left out
@@ -82,6 +91,7 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const log = opts.log;
   const minRequestIntervalMs = opts.minRequestIntervalMs ?? 0;
+  const minPollIntervalMs = opts.minPollIntervalMs ?? 0;
   let nextRequestAt = 0;
   let requestTurn = Promise.resolve();
   let accessRetryAt = 0;
@@ -95,6 +105,9 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
   }
   if (!Number.isFinite(minRequestIntervalMs) || minRequestIntervalMs < 0) {
     throw new RangeError("minRequestIntervalMs must be finite and nonnegative");
+  }
+  if (!Number.isFinite(minPollIntervalMs) || minPollIntervalMs < 0) {
+    throw new RangeError(`minPollIntervalMs must be 0 or more, got ${minPollIntervalMs}`);
   }
   const headers: Record<string, string> = opts.apiKey
     ? { Authorization: `Bearer ${opts.apiKey}` }
@@ -265,7 +278,15 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
       // a first block may name a parent below `fromHeight` and no other. Kept across polls, which
       // `next` (the first height not requested yet) cannot be.
       let lastDelivered = fromHeight - 1n;
+      // When the last final-height poll started, for `minPollIntervalMs`. None yet.
+      let lastPollAt: number | null = null;
       while (!stop.signal.aborted) {
+        if (minPollIntervalMs > 0 && lastPollAt !== null) {
+          const wait = lastPollAt + minPollIntervalMs - Date.now();
+          if (wait > 0) await sleep(wait, stop.signal);
+          if (stop.signal.aborted) return;
+        }
+        lastPollAt = Date.now();
         const final = await fetchFinalHeight(stop.signal);
         if (final === STOPPED) return;
         if (final < next) {

@@ -1032,6 +1032,46 @@ test("polls_when_caught_up", async () => {
   await finished;
 });
 
+test("min_poll_interval_spaces_the_polls_of_a_moving_chain", async () => {
+  fakeClock();
+  // A chain that has a new final block every time it is asked: without a floor, the source would
+  // poll again as soon as it had yielded each one.
+  let final = 10;
+  const server = fakeServer(({ path }) => {
+    if (path === FINAL) {
+      final += 1;
+      return json(chainBlock(final));
+    }
+    return json(chainBlock(heightOf(path)));
+  });
+  const { ctrl, heights, finished } = run(
+    source(server, { pollMs: 0, minPollIntervalMs: 5000 }),
+    10n,
+  );
+
+  await settle();
+  // One poll so far: it found 11, and 10 and 11 were fetched.
+  expect(server.finalRequests()).toBe(1);
+  expect(heights).toEqual([10, 11]);
+  await tick(4999);
+  expect(server.finalRequests()).toBe(1);
+  await tick(1);
+  expect(server.finalRequests()).toBe(2);
+  expect(heights).toEqual([10, 11, 12]);
+  await tick(5000);
+  expect(server.finalRequests()).toBe(3);
+  expect(heights).toEqual([10, 11, 12, 13]);
+
+  ctrl.abort();
+  await finished;
+});
+
+test("refuses_a_negative_min_poll_interval", () => {
+  expect(() => createNeardataSource({ baseUrl: "http://x", minPollIntervalMs: -1 })).toThrow(
+    /minPollIntervalMs/,
+  );
+});
+
 test("waits_for_the_chain_to_reach_the_start_height", async () => {
   fakeClock();
   let final = 12;

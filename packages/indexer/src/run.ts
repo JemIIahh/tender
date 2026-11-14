@@ -135,7 +135,9 @@ const DEPLOYMENTS_DIR = fileURLToPath(new URL("../../../deployments/", import.me
  *
  * - **Source** (P03-R6): the RPC source at `NEAR_RPC_URL` when `TENDER_NETWORK` is `sandbox`,
  *   neardata otherwise, at `NEARDATA_URL` (default: the network's) with `FASTNEAR_API_KEY`. Neither
- *   ever stands in for the other. `INDEXER_POLL_MS` sets how often a source that has caught up
+ *   ever stands in for the other. `INDEXER_MIN_POLL_MS` is the least time between two of
+ *   neardata's final-height polls (default none), which saves requests once caught up.
+ *   `INDEXER_POLL_MS` sets how often a source that has caught up
  *   looks again.
  *   No lifetime HTTP request cap is imposed. Provider access errors retry with backoff.
  * - **Start**: `INDEXER_START_HEIGHT`; else the `deployHeight` in the deploy script's record,
@@ -219,6 +221,7 @@ interface Config {
   contractId: string;
   teamAccounts: string[];
   pollMs?: number;
+  minPollMs?: number;
 }
 
 /** The key of the indexer's row in `chain_cursor`: `<network>:<contractId>`. */
@@ -722,11 +725,16 @@ function readConfig(env: Record<string, string | undefined>): Config {
   if (poll !== undefined && !(/^\d+$/.test(poll) && Number.isSafeInteger(Number(poll)))) {
     throw new Error("INDEXER_POLL_MS must be a whole number of milliseconds");
   }
+  const minPoll = setting(env, "INDEXER_MIN_POLL_MS");
+  if (minPoll !== undefined && !(/^\d+$/.test(minPoll) && Number.isSafeInteger(Number(minPoll)))) {
+    throw new Error("INDEXER_MIN_POLL_MS must be a whole number of milliseconds");
+  }
   return {
     network: network as NetworkId,
     contractId,
     teamAccounts,
     pollMs: poll === undefined ? undefined : Number(poll),
+    minPollMs: minPoll === undefined ? undefined : Number(minPoll),
   };
 }
 
@@ -820,6 +828,7 @@ function sourceOf(
     // neardata redirects to the block, takes two of those slots, and so does any other redirect.
     minRequestIntervalMs: apiKey === undefined ? 400 : 0,
     pollMs: config.pollMs,
+    minPollIntervalMs: config.minPollMs,
     log: (line) => log(line.replaceAll(base, "NEARDATA_URL")),
   });
 }
